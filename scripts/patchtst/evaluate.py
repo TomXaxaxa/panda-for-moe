@@ -21,9 +21,45 @@ from panda.utils import (
     save_evaluation_results,
 )
 
+import torch.distributed as dist
+from panda.utils import is_main_process
+from panda.patchtst.deepseek_moe import MoEGate, DeepseekMLP
+
 logger = logging.getLogger(__name__)
 log = partial(log_on_main, logger=logger)
 
+def log_moe_stats(model: torch.nn.Module):
+    """
+    聚合（支持DDP）并打印模型中所有MoE层的专家使用情况。
+    """
+    if is_main_process(): # 只在主进程（rank 0）执行打印
+        print("\n" + "="*50)
+        print(" " * 15 + "MoE Expert Usage Report")
+        print("="*50)
+        
+        # 遍历模型找到MoE门
+        for i, module in enumerate(model.modules()):
+            if isinstance(module, MoEGate):
+                # 如果是分布式环境，需要从所有GPU聚合统计数据
+                if dist.is_initialized():
+                    dist.all_reduce(module.expert_usage_count, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(module.total_tokens_routed, op=dist.ReduceOp.SUM)
+
+                if module.total_tokens_routed.item() == 0:
+                    print(f"MoE Layer {i}: No tokens were routed during evaluation. Skipping report.")
+                    continue
+                    
+                usage_percentages = module.expert_usage_count / module.total_tokens_routed.item() * 100
+                
+                print(f"\n--- MoE Layer in module (approx. layer {i//10}) ---") # 提供一个粗略的层位置
+                print(f"Total routing events during evaluation: {module.total_tokens_routed.item()}")
+                for exp_idx in range(module.n_routed_experts):
+                    print(
+                        f"  Expert {exp_idx:02d}: "
+                        f"routed {module.expert_usage_count[exp_idx].item():>8d} times "
+                        f"({usage_percentages[exp_idx]:.2f}%)"
+                    )
+        print("="*50 + "\n")
 
 @hydra.main(config_path="../../config", config_name="config", version_base=None)
 def main(cfg):
@@ -106,6 +142,10 @@ def main(cfg):
         log(f"dynamics embedding config: {dynamics_embedding_config}")
 
     pipeline.model.eval()
+
+    if hasattr(pipeline.model, "reset_moe_stats"):
+        log("Resetting MoE statistics...")
+        pipeline.model.reset_moe_stats()
 
     # for convenience, get system dimensions, for saving as a column in the metrics csv
     system_dims = {
@@ -225,6 +265,9 @@ def main(cfg):
             process_trajs_fn(cfg.eval.timestep_masks_save_dir, timestep_masks)
     else:
         raise ValueError(f"Invalid eval mode: {cfg.eval.mode}")
+    
+    log("Logging MoE statistics...")
+    log_moe_stats(pipeline.model)
 
 
 if __name__ == "__main__":

@@ -201,98 +201,99 @@ def evaluate_forecasting_model(
     if parallel_sample_reduction_fn is None:
         parallel_sample_reduction_fn = lambda x: x
 
-    for system in tqdm(systems, desc="Forecasting..."):
-        dataset = systems[system]
-        predictions, labels, contexts, future_values = [], [], [], []
+    with torch.cuda.device(pipeline.device):
+        for system in tqdm(systems, desc="Forecasting..."):
+            dataset = systems[system]
+            predictions, labels, contexts, future_values = [], [], [], []
 
-        # length of the dataset iterator is equal to len(dataset.datasets)*num_eval_windows
-        # for each eval window style:
-        # - sampled: num_eval_windows = num_test_instances
-        # - rolling: num_eval_windows = (T - context_length - prediction_length) // window_stride + 1
-        # - single: num_eval_windows = 1
-        for batch in batcher(dataset, batch_size=batch_size):
-            past_values, future_values = zip(
-                *[(data["past_values"], data["future_values"]) for data in batch]
-            )
-            # shape: (batch_size, context_length, num_channels)
-            past_batch = torch.stack(past_values, dim=0).to(pipeline.device)
-
-            # shape: (num_parallel_samples, batch size, prediction_length, num_channels)
-            # shit changes when using a channel sampler. notably, the batch dim, but it doesnt
-            # matter if one just needs to aggregate over that to get metrics
-            preds = (
-                pipeline.predict(
-                    past_batch, prediction_length=prediction_length, **prediction_kwargs
+            # length of the dataset iterator is equal to len(dataset.datasets)*num_eval_windows
+            # for each eval window style:
+            # - sampled: num_eval_windows = num_test_instances
+            # - rolling: num_eval_windows = (T - context_length - prediction_length) // window_stride + 1
+            # - single: num_eval_windows = 1
+            for batch in batcher(dataset, batch_size=batch_size):
+                past_values, future_values = zip(
+                    *[(data["past_values"], data["future_values"]) for data in batch]
                 )
-                .transpose(0, 1)
-                .cpu()
-                .numpy()
-            )
-            context = past_batch.cpu().numpy()
+                # shape: (batch_size, context_length, num_channels)
+                past_batch = torch.stack(past_values, dim=0).to(pipeline.device)
 
-            # shape: (batch size, sampler_prediction_length, num_channels)
-            future_batch = torch.stack(future_values, dim=0).cpu().numpy()
-
-            # Truncate predictions to match future_batch length if needed
-            if preds.shape[2] > future_batch.shape[1]:
-                preds = preds[..., : future_batch.shape[1], :]
-
-            # if channel sampler is used, the preds batch size and num_channels changes
-            # reflect the changes in the other tensors as well
-            if channel_sampler is not None:
-                future_batch = channel_sampler(
-                    torch.from_numpy(future_batch), resample_inds=False
-                ).numpy()
-                context = channel_sampler(
-                    torch.from_numpy(context), resample_inds=False
-                ).numpy()
-
-            # standardize using stats from the past_batch
-            if redo_normalization:
-                preds = safe_standardize(preds, context=context[None, :, :], axis=2)
-                future_batch = safe_standardize(future_batch, context=context, axis=1)
-                context = safe_standardize(context, axis=1)
-
-            labels.append(future_batch)
-            predictions.append(preds)
-            contexts.append(context)
-
-        # if num_parallel_reduction_fn is None, the shape is:
-        # shape: (num_parallel_samples, num_eval_windows * num_datasets, prediction_length, num_channels)
-        # otherwise, the shape is:
-        # shape: (num_eval_windows * num_datasets, prediction_length, num_channels)
-        predictions = np.concatenate(predictions, axis=1)
-        predictions = parallel_sample_reduction_fn(predictions)
-        labels = np.concatenate(labels, axis=0)
-
-        # shape: (num_eval_windows * num_datasets, context_length, num_channels)
-        contexts = np.concatenate(contexts, axis=0)
-
-        # evaluate metrics for multiple forecast lengths on user-specified subintervals
-        # as well as the full prediction length interval
-        if metric_names is not None:
-            assert all(start < prediction_length for start, _ in eval_subintervals), (
-                "All start indices must be less than the prediction length"
-            )
-            for start, end in eval_subintervals:
-                system_metrics[end - start][system] = compute_metrics(
-                    predictions[:, start:end, :],
-                    labels[:, start:end, :],
-                    include=metric_names,
-                    batch_axis=0,
+                # shape: (num_parallel_samples, batch size, prediction_length, num_channels)
+                # shit changes when using a channel sampler. notably, the batch dim, but it doesnt
+                # matter if one just needs to aggregate over that to get metrics
+                preds = (
+                    pipeline.predict(
+                        past_batch, prediction_length=prediction_length, **prediction_kwargs
+                    )
+                    .transpose(0, 1)
+                    .cpu()
+                    .numpy()
                 )
+                context = past_batch.cpu().numpy()
 
-        # shape: (num_eval_windows * num_datasets, num_channels, prediction_length or context_length)
-        if return_predictions:
-            system_predictions[system] = predictions.transpose(0, 2, 1)
-        if return_contexts:
-            system_contexts[system] = contexts.transpose(0, 2, 1)
-        if return_labels:
-            system_labels[system] = labels.transpose(0, 2, 1)
+                # shape: (batch size, sampler_prediction_length, num_channels)
+                future_batch = torch.stack(future_values, dim=0).cpu().numpy()
 
-    return (
-        system_predictions if return_predictions else None,
-        system_contexts if return_contexts else None,
-        system_labels if return_labels else None,
-        system_metrics,
-    )
+                # Truncate predictions to match future_batch length if needed
+                if preds.shape[2] > future_batch.shape[1]:
+                    preds = preds[..., : future_batch.shape[1], :]
+
+                # if channel sampler is used, the preds batch size and num_channels changes
+                # reflect the changes in the other tensors as well
+                if channel_sampler is not None:
+                    future_batch = channel_sampler(
+                        torch.from_numpy(future_batch), resample_inds=False
+                    ).numpy()
+                    context = channel_sampler(
+                        torch.from_numpy(context), resample_inds=False
+                    ).numpy()
+
+                # standardize using stats from the past_batch
+                if redo_normalization:
+                    preds = safe_standardize(preds, context=context[None, :, :], axis=2)
+                    future_batch = safe_standardize(future_batch, context=context, axis=1)
+                    context = safe_standardize(context, axis=1)
+
+                labels.append(future_batch)
+                predictions.append(preds)
+                contexts.append(context)
+
+            # if num_parallel_reduction_fn is None, the shape is:
+            # shape: (num_parallel_samples, num_eval_windows * num_datasets, prediction_length, num_channels)
+            # otherwise, the shape is:
+            # shape: (num_eval_windows * num_datasets, prediction_length, num_channels)
+            predictions = np.concatenate(predictions, axis=1)
+            predictions = parallel_sample_reduction_fn(predictions)
+            labels = np.concatenate(labels, axis=0)
+
+            # shape: (num_eval_windows * num_datasets, context_length, num_channels)
+            contexts = np.concatenate(contexts, axis=0)
+
+            # evaluate metrics for multiple forecast lengths on user-specified subintervals
+            # as well as the full prediction length interval
+            if metric_names is not None:
+                assert all(start < prediction_length for start, _ in eval_subintervals), (
+                    "All start indices must be less than the prediction length"
+                )
+                for start, end in eval_subintervals:
+                    system_metrics[end - start][system] = compute_metrics(
+                        predictions[:, start:end, :],
+                        labels[:, start:end, :],
+                        include=metric_names,
+                        batch_axis=0,
+                    )
+
+            # shape: (num_eval_windows * num_datasets, num_channels, prediction_length or context_length)
+            if return_predictions:
+                system_predictions[system] = predictions.transpose(0, 2, 1)
+            if return_contexts:
+                system_contexts[system] = contexts.transpose(0, 2, 1)
+            if return_labels:
+                system_labels[system] = labels.transpose(0, 2, 1)
+
+        return (
+            system_predictions if return_predictions else None,
+            system_contexts if return_contexts else None,
+            system_labels if return_labels else None,
+            system_metrics,
+        )

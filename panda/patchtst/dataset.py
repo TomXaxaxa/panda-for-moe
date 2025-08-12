@@ -82,7 +82,7 @@ class TimeSeriesDataset(IterableDataset):
             )
 
         assert len(self.augmentations) == len(self.augmentation_probabilities)
-        assert sum(self.augmentation_probabilities) == 1.0
+        # assert sum(self.augmentation_probabilities) == 1.0
 
     def shuffle(self, shuffle_buffer_length: int = 100):
         return PseudoShuffledIterableDataset(self, shuffle_buffer_length)

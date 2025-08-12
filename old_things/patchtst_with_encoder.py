@@ -32,35 +32,6 @@ from .modules import (
     apply_p_rope_to_qk,
 )
 
-from .deepseek_moe import DeepseekMoE
-
-class PatchTSTMoEWrapper(nn.Module):
-    def __init__(self, config: PatchTSTConfig):
-        super().__init__()
-        
-        class MockDeepseekConfig:
-            def __init__(self, patchtst_config):
-                self.hidden_size = patchtst_config.d_model
-                self.intermediate_size = patchtst_config.ffn_dim
-                self.hidden_act = patchtst_config.activation_function
-                
-                self.n_routed_experts = getattr(patchtst_config, "n_routed_experts", 8)
-                self.num_experts_per_tok = getattr(patchtst_config, "num_experts_per_tok", 2)
-                self.moe_intermediate_size = getattr(patchtst_config, "moe_intermediate_size", 1024)
-                
-                self.n_shared_experts = getattr(patchtst_config, "n_shared_experts", 0)
-                
-                self.scoring_func = getattr(patchtst_config, "scoring_func", "softmax")
-                self.aux_loss_alpha = getattr(patchtst_config, "aux_loss_alpha", 0.01)
-                self.seq_aux = getattr(patchtst_config, "seq_aux", False)
-                self.norm_topk_prob = getattr(patchtst_config, "norm_topk_prob", True)
-
-        mock_config = MockDeepseekConfig(config)
-        
-        self.moe_layer = DeepseekMoE(mock_config)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.moe_layer(hidden_states)
 
 @dataclass
 class CompletionsPatchTSTOutput(ModelOutput):
@@ -298,22 +269,22 @@ class PatchTSTEncoderLayerWithRope(nn.Module):
         super().__init__()
 
         self.channel_attention = config.channel_attention
-        # # Multi-Head attention
-        # self.temporal_self_attn = PatchTSTRopeAttention(
-        #     embed_dim=config.d_model,
-        #     num_heads=config.num_attention_heads,
-        #     dropout=config.attention_dropout,
-        #     use_rope=True,
-        #     max_wavelength=config.max_wavelength,
-        #     rope_percent=config.rope_percent,
-        # )
-        self.temporal_mamba = Mamba2(
-            d_model=config.d_model,
-            d_state=1024,
-            d_conv=4,
-            expand=2,
-            headdim=64
+        # Multi-Head attention
+        self.temporal_self_attn = PatchTSTRopeAttention(
+            embed_dim=config.d_model,
+            num_heads=config.num_attention_heads,
+            dropout=config.attention_dropout,
+            use_rope=True,
+            max_wavelength=config.max_wavelength,
+            rope_percent=config.rope_percent,
         )
+        # self.temporal_mamba = Mamba2(
+        #     d_model=config.d_model,
+        #     d_state=1024,
+        #     d_conv=4,
+        #     expand=2,
+        #     headdim=64
+        # )
         if self.channel_attention:
             self.channel_self_attn = PatchTSTRopeAttention(
                 embed_dim=config.d_model,
@@ -358,22 +329,12 @@ class PatchTSTEncoderLayerWithRope(nn.Module):
                 )
 
         # Position-wise Feed-Forward
-        # self.ff = nn.Sequential(
-        #     nn.Linear(config.d_model, config.ffn_dim, bias=config.bias),
-        #     ACT2CLS[config.activation_function](),
-        #     nn.Dropout(config.ff_dropout) if config.ff_dropout > 0 else nn.Identity(),
-        #     nn.Linear(config.ffn_dim, config.d_model, bias=config.bias),
-        # )
-        
-        if getattr(config, "n_routed_experts", 0) > 0:
-            self.ff = PatchTSTMoEWrapper(config)
-        else:
-            self.ff = nn.Sequential(
-                nn.Linear(config.d_model, config.ffn_dim, bias=config.bias),
-                ACT2CLS[config.activation_function](),
-                nn.Dropout(config.ff_dropout) if config.ff_dropout > 0 else nn.Identity(),
-                nn.Linear(config.ffn_dim, config.d_model, bias=config.bias),
-            )
+        self.ff = nn.Sequential(
+            nn.Linear(config.d_model, config.ffn_dim, bias=config.bias),
+            ACT2CLS[config.activation_function](),
+            nn.Dropout(config.ff_dropout) if config.ff_dropout > 0 else nn.Identity(),
+            nn.Linear(config.ffn_dim, config.d_model, bias=config.bias),
+        )
 
         # Add & Norm of sublayer 3
         self.dropout_path3 = (
@@ -418,31 +379,31 @@ class PatchTSTEncoderLayerWithRope(nn.Module):
         )
 
         if self.pre_norm:
-            # ## Norm and Multi-Head attention and Add residual connection
-            # attn_output, attn_weights, _ = self.temporal_self_attn(
-            #     hidden_states=self.norm_sublayer1(hidden_state),
-            #     output_attentions=output_attentions,
-            # )
-            # # Add: residual connection with residual dropout
-            # hidden_state = hidden_state + self.dropout_path1(attn_output)
-            mamba_input = self.norm_sublayer1(hidden_state)
-            mamba_output = self.temporal_mamba(mamba_input)
-            hidden_state = hidden_state + self.dropout_path1(mamba_output)
+            ## Norm and Multi-Head attention and Add residual connection
+            attn_output, attn_weights, _ = self.temporal_self_attn(
+                hidden_states=self.norm_sublayer1(hidden_state),
+                output_attentions=output_attentions,
+            )
+            # Add: residual connection with residual dropout
+            hidden_state = hidden_state + self.dropout_path1(attn_output)
+            # mamba_input = self.norm_sublayer1(hidden_state)
+            # mamba_output = self.temporal_mamba(mamba_input)
+            # hidden_state = hidden_state + self.dropout_path1(mamba_output)
         else:
-            # ## Multi-Head attention and Add residual connection and Norm - Standard Transformer from BERT
-            # attn_output, attn_weights, _ = self.temporal_self_attn(
-            #     hidden_states=hidden_state,
-            #     output_attentions=output_attentions,
-            #     linear_attn=linear_attn,
-            # )
-            # # hidden_states: [(bs*num_channels) x sequence_length x d_model]
-            # hidden_state = self.norm_sublayer1(
-            #     hidden_state + self.dropout_path1(attn_output)
-            # )
-            mamba_output = self.temporal_mamba(hidden_state)
-            hidden_state = self.norm_sublayer1(hidden_state + self.dropout_path1(mamba_output))
+            ## Multi-Head attention and Add residual connection and Norm - Standard Transformer from BERT
+            attn_output, attn_weights, _ = self.temporal_self_attn(
+                hidden_states=hidden_state,
+                output_attentions=output_attentions,
+                linear_attn=linear_attn,
+            )
+            # hidden_states: [(bs*num_channels) x sequence_length x d_model]
+            hidden_state = self.norm_sublayer1(
+                hidden_state + self.dropout_path1(attn_output)
+            )
+            # mamba_output = self.temporal_mamba(hidden_state)
+            # hidden_state = self.norm_sublayer1(hidden_state + self.dropout_path1(mamba_output))
             
-        attn_weights = None
+        # attn_weights = None
 
         # hidden_state: [bs x num_channels x sequence_length x d_model]
         hidden_state = hidden_state.reshape(

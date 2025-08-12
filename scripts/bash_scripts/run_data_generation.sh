@@ -28,7 +28,7 @@ if [ "$DEBUG" -eq 0 ]; then
         sampling.atol=1e-10 \
         sampling.rtol=1e-8 \
         sampling.silence_integration_errors=true \
-        sampling.data_dir=$WORK/data/new_skew40 \
+        sampling.data_dir=./panda/data/new_skew40 \
         sampling.rseed=414328 \
         sampling.ic_rseed=414 \
         sampling.test_split=0.3 \
@@ -42,7 +42,7 @@ if [ "$DEBUG" -eq 0 ]; then
         skew.num_pairs=2048 \
         skew.pairs_rseed=328 \
         skew.sys_idx_low=0 \
-        skew.sys_idx_high=512 \
+        skew.sys_idx_high=48 \
         validator.transient_time_frac=0.2 \
         run_name=new_skew40 \
         wandb.log=true \
@@ -62,7 +62,7 @@ if [ "$DEBUG" -eq 0 ]; then
     #    sampling.atol=1e-10 \
     #    sampling.rtol=1e-8 \
     #    sampling.silence_integration_errors=true \
-    #    sampling.data_dir=$WORK/data/big_base_mixedp \
+    #    sampling.data_dir=./panda/data/big_base_mixedp \
     #    sampling.rseed=21433 \
     #    sampling.verbose=false \
     #    events.verbose=false \
@@ -83,7 +83,7 @@ else
         sampling.atol=1e-10 \
         sampling.rtol=1e-8 \
         sampling.silence_integration_errors=true \
-        sampling.data_dir=$WORK/data/skew_debug \
+        sampling.data_dir=./panda/data/skew_debug \
         sampling.rseed=414328 \
         sampling.ic_rseed=414 \
         sampling.verbose=false \

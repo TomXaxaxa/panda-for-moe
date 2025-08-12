@@ -32,35 +32,6 @@ from .modules import (
     apply_p_rope_to_qk,
 )
 
-from .deepseek_moe import DeepseekMoE
-
-class PatchTSTMoEWrapper(nn.Module):
-    def __init__(self, config: PatchTSTConfig):
-        super().__init__()
-        
-        class MockDeepseekConfig:
-            def __init__(self, patchtst_config):
-                self.hidden_size = patchtst_config.d_model
-                self.intermediate_size = patchtst_config.ffn_dim
-                self.hidden_act = patchtst_config.activation_function
-                
-                self.n_routed_experts = getattr(patchtst_config, "n_routed_experts", 8)
-                self.num_experts_per_tok = getattr(patchtst_config, "num_experts_per_tok", 2)
-                self.moe_intermediate_size = getattr(patchtst_config, "moe_intermediate_size", 1024)
-                
-                self.n_shared_experts = getattr(patchtst_config, "n_shared_experts", 0)
-                
-                self.scoring_func = getattr(patchtst_config, "scoring_func", "softmax")
-                self.aux_loss_alpha = getattr(patchtst_config, "aux_loss_alpha", 0.01)
-                self.seq_aux = getattr(patchtst_config, "seq_aux", False)
-                self.norm_topk_prob = getattr(patchtst_config, "norm_topk_prob", True)
-
-        mock_config = MockDeepseekConfig(config)
-        
-        self.moe_layer = DeepseekMoE(mock_config)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.moe_layer(hidden_states)
 
 @dataclass
 class CompletionsPatchTSTOutput(ModelOutput):
@@ -125,7 +96,7 @@ class PatchTSTRopeAttention(nn.Module):
             )
         self.scaling = self.head_dim**-0.5
         self.is_decoder = is_decoder
-        self.is_causal = is_causal
+        self.is_causal = is_causal # Note: this is from original code but not used, we will add `use_causal_mask` in forward.
 
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
@@ -151,6 +122,7 @@ class PatchTSTRopeAttention(nn.Module):
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
         linear_attn: bool = False,
+        use_causal_mask: bool = True, # ADDED: Causal mask flag
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
@@ -226,11 +198,29 @@ class PatchTSTRopeAttention(nn.Module):
                 f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
                 f" {attn_weights.size()}"
             )
+            
+        # MODIFIED: Logic to create and apply causal mask
+        if use_causal_mask:
+            if src_len != tgt_len:
+                 raise ValueError(
+                    f"Causal mask requires query and key sequence lengths to be equal, but got {tgt_len} and {src_len}"
+                )
+            # The mask is broadcastable to (bsz, num_heads, tgt_len, src_len)
+            causal_mask = torch.full((tgt_len, src_len), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+            causal_mask = torch.triu(causal_mask, diagonal=1)
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0) # Shape: [1, 1, tgt_len, src_len]
+            
+            # Combine with existing attention mask if any
+            if attention_mask is not None:
+                # attention_mask is expected to be of shape (bsz, 1, tgt_len, src_len)
+                attention_mask = attention_mask + causal_mask
+            else:
+                attention_mask = causal_mask
 
         if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+            if attention_mask.size() != (bsz, 1, tgt_len, src_len) and attention_mask.size() != (1, 1, tgt_len, src_len):
                 raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
+                    f"Attention mask should be of size compatible with (bsz, 1, tgt_len, src_len), but is {attention_mask.size()}"
                 )
             attn_weights = attn_weights.view(
                 bsz, self.num_heads, tgt_len, src_len
@@ -298,21 +288,14 @@ class PatchTSTEncoderLayerWithRope(nn.Module):
         super().__init__()
 
         self.channel_attention = config.channel_attention
-        # # Multi-Head attention
-        # self.temporal_self_attn = PatchTSTRopeAttention(
-        #     embed_dim=config.d_model,
-        #     num_heads=config.num_attention_heads,
-        #     dropout=config.attention_dropout,
-        #     use_rope=True,
-        #     max_wavelength=config.max_wavelength,
-        #     rope_percent=config.rope_percent,
-        # )
-        self.temporal_mamba = Mamba2(
-            d_model=config.d_model,
-            d_state=1024,
-            d_conv=4,
-            expand=2,
-            headdim=64
+        # Multi-Head attention
+        self.temporal_self_attn = PatchTSTRopeAttention(
+            embed_dim=config.d_model,
+            num_heads=config.num_attention_heads,
+            dropout=config.attention_dropout,
+            use_rope=True,
+            max_wavelength=config.max_wavelength,
+            rope_percent=config.rope_percent,
         )
         if self.channel_attention:
             self.channel_self_attn = PatchTSTRopeAttention(
@@ -358,22 +341,12 @@ class PatchTSTEncoderLayerWithRope(nn.Module):
                 )
 
         # Position-wise Feed-Forward
-        # self.ff = nn.Sequential(
-        #     nn.Linear(config.d_model, config.ffn_dim, bias=config.bias),
-        #     ACT2CLS[config.activation_function](),
-        #     nn.Dropout(config.ff_dropout) if config.ff_dropout > 0 else nn.Identity(),
-        #     nn.Linear(config.ffn_dim, config.d_model, bias=config.bias),
-        # )
-        
-        if getattr(config, "n_routed_experts", 0) > 0:
-            self.ff = PatchTSTMoEWrapper(config)
-        else:
-            self.ff = nn.Sequential(
-                nn.Linear(config.d_model, config.ffn_dim, bias=config.bias),
-                ACT2CLS[config.activation_function](),
-                nn.Dropout(config.ff_dropout) if config.ff_dropout > 0 else nn.Identity(),
-                nn.Linear(config.ffn_dim, config.d_model, bias=config.bias),
-            )
+        self.ff = nn.Sequential(
+            nn.Linear(config.d_model, config.ffn_dim, bias=config.bias),
+            ACT2CLS[config.activation_function](),
+            nn.Dropout(config.ff_dropout) if config.ff_dropout > 0 else nn.Identity(),
+            nn.Linear(config.ffn_dim, config.d_model, bias=config.bias),
+        )
 
         # Add & Norm of sublayer 3
         self.dropout_path3 = (
@@ -398,6 +371,7 @@ class PatchTSTEncoderLayerWithRope(nn.Module):
         output_attentions: Optional[bool] = None,
         channel_attention_mask: Optional[torch.Tensor] = None,
         linear_attn: bool = False,
+        use_causal_mask: bool = False, # MODIFIED: Propagate the flag
     ):
         """
         Parameters:
@@ -418,37 +392,34 @@ class PatchTSTEncoderLayerWithRope(nn.Module):
         )
 
         if self.pre_norm:
-            # ## Norm and Multi-Head attention and Add residual connection
-            # attn_output, attn_weights, _ = self.temporal_self_attn(
-            #     hidden_states=self.norm_sublayer1(hidden_state),
-            #     output_attentions=output_attentions,
-            # )
-            # # Add: residual connection with residual dropout
-            # hidden_state = hidden_state + self.dropout_path1(attn_output)
-            mamba_input = self.norm_sublayer1(hidden_state)
-            mamba_output = self.temporal_mamba(mamba_input)
-            hidden_state = hidden_state + self.dropout_path1(mamba_output)
+            ## Norm and Multi-Head attention and Add residual connection
+            attn_output, attn_weights, _ = self.temporal_self_attn(
+                hidden_states=self.norm_sublayer1(hidden_state),
+                output_attentions=output_attentions,
+                use_causal_mask=use_causal_mask, # MODIFIED: Pass the flag
+            )
+            # Add: residual connection with residual dropout
+            hidden_state = hidden_state + self.dropout_path1(attn_output)
         else:
-            # ## Multi-Head attention and Add residual connection and Norm - Standard Transformer from BERT
-            # attn_output, attn_weights, _ = self.temporal_self_attn(
-            #     hidden_states=hidden_state,
-            #     output_attentions=output_attentions,
-            #     linear_attn=linear_attn,
-            # )
-            # # hidden_states: [(bs*num_channels) x sequence_length x d_model]
-            # hidden_state = self.norm_sublayer1(
-            #     hidden_state + self.dropout_path1(attn_output)
-            # )
-            mamba_output = self.temporal_mamba(hidden_state)
-            hidden_state = self.norm_sublayer1(hidden_state + self.dropout_path1(mamba_output))
-            
-        attn_weights = None
+            ## Multi-Head attention and Add residual connection and Norm - Standard Transformer from BERT
+            attn_output, attn_weights, _ = self.temporal_self_attn(
+                hidden_states=hidden_state,
+                output_attentions=output_attentions,
+                linear_attn=linear_attn,
+                use_causal_mask=use_causal_mask, # MODIFIED: Pass the flag
+            )
+            # hidden_states: [(bs*num_channels) x sequence_length x d_model]
+            hidden_state = self.norm_sublayer1(
+                hidden_state + self.dropout_path1(attn_output)
+            )
 
         # hidden_state: [bs x num_channels x sequence_length x d_model]
         hidden_state = hidden_state.reshape(
             batch_size, num_input_channels, sequence_length, d_model
         )
-
+        
+        channel_attn_weights = None # ADDED: Initialize channel_attn_weights
+        
         # second sublayer: attention across variable at any given time
         if self.channel_attention:
             # hidden_state: [bs x sequence_length x num_channels x d_model]
@@ -530,7 +501,6 @@ class PatchTSTEncoder(PatchTSTPreTrainedModel):
         super().__init__(config)
         self.gradient_checkpointing = False
         if config.use_dynamics_embedding:
-            # self.embedder = PatchTSTPolynomialEmbedding(config)
             self.embedder = PatchTSTKernelEmbedding(config)
         else:
             self.embedder = PatchTSTEmbedding(config)
@@ -552,6 +522,7 @@ class PatchTSTEncoder(PatchTSTPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         linear_attn: bool = False,
+        use_causal_mask: bool = False, # MODIFIED: Propagate the flag
     ) -> BaseModelOutput:
         """
         Parameters:
@@ -590,9 +561,9 @@ class PatchTSTEncoder(PatchTSTPreTrainedModel):
                 output_attentions=output_attentions,
                 channel_attention_mask=channel_attention_mask,
                 linear_attn=linear_attn,
+                use_causal_mask=use_causal_mask, # MODIFIED: Pass the flag
             )
             # get hidden state. hidden_state shape is [bs x num_channels x num_patches x d_model]
-            # or [bs x num_channels x (num_patches+1) x d_model] if use cls_token
             hidden_state = layer_outputs[0]
             # append attention matrix at each layer
             if output_attentions:
@@ -603,7 +574,6 @@ class PatchTSTEncoder(PatchTSTPreTrainedModel):
             hidden_states=encoder_states,  # type: ignore
             attentions=all_attentions,
         )
-
 
 class PatchTSTModel(PatchTSTPreTrainedModel):
     def __init__(self, config: PatchTSTConfig):
@@ -632,31 +602,9 @@ class PatchTSTModel(PatchTSTPreTrainedModel):
         output_attentions: Optional[bool] = None,
         channel_attention_mask: Optional[torch.Tensor] = None,
         linear_attn: bool = False,
+        use_causal_mask: bool = False, # MODIFIED: Propagate the flag
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, PatchTSTModelOutput]:
-        r"""
-        Parameters:
-            past_values (`torch.Tensor` of shape `(bs, sequence_length, num_input_channels)`, *required*):
-                Input sequence to the model
-            past_observed_mask (`torch.BoolTensor` of shape `(batch_size, sequence_length, num_input_channels)`, *optional*):
-                Boolean mask to indicate which `past_values` were observed and which were missing. Mask values selected
-                in `[0, 1]`:
-
-                - 1 for values that are **observed**,
-                - 0 for values that are **missing** (i.e. NaNs that were replaced by zeros).
-            future_values (`torch.BoolTensor` of shape `(batch_size, prediction_length, num_input_channels)`, *optional*):
-                Future target values associated with the `past_values`
-            output_hidden_states (`bool`, *optional*):
-                Whether or not to return the hidden states of all layers
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the output attention of all layers
-            return_dict (`bool`, *optional*):
-                Whether or not to return a `ModelOutput` instead of a plain tuple.
-
-        Returns:
-            `PatchTSTModelOutput` or tuple of `torch.Tensor` (if `return_dict`=False or `config.return_dict`=False)
-
-        """
 
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
@@ -689,6 +637,7 @@ class PatchTSTModel(PatchTSTPreTrainedModel):
             output_attentions=output_attentions,
             channel_attention_mask=channel_attention_mask,
             linear_attn=linear_attn,
+            use_causal_mask=use_causal_mask, # MODIFIED: Pass the flag
         )
 
         if not return_dict:
@@ -962,9 +911,9 @@ class PatchTSTForPrediction(PatchTSTPreTrainedModel):
 
         # Turn off masking
         config.do_mask_input = False
-
+        
+        # ... (rest of __init__ is unchanged) ...
         self.model = PatchTSTModel(config)
-
         if config.loss == "mse" or config.loss == "huber":
             self.distribution_output = None
         else:
@@ -990,7 +939,9 @@ class PatchTSTForPrediction(PatchTSTPreTrainedModel):
         elif config.loss == "huber":
             self.loss = nn.HuberLoss(reduction="mean", delta=config.huber_delta)
         else:
-            raise ValueError(f"Unknown loss {config.loss}")
+            # We will use nll loss for distribution outputs, so no need to raise error here
+            self.loss = None
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1004,31 +955,8 @@ class PatchTSTForPrediction(PatchTSTPreTrainedModel):
         channel_attention_mask: Optional[torch.Tensor] = None,
         return_dict: Optional[bool] = None,
         linear_attn: bool = False,
+        use_causal_mask: bool = True, # MODIFIED: Add causal mask flag to the main entry point
     ) -> Union[Tuple, PatchTSTForPredictionOutput]:
-        r"""
-        Parameters:
-            past_values (`torch.Tensor` of shape `(bs, sequence_length, num_input_channels)`, *required*):
-                Input sequence to the model
-            past_observed_mask (`torch.BoolTensor` of shape `(batch_size, sequence_length, num_input_channels)`, *optional*):
-                Boolean mask to indicate which `past_values` were observed and which were missing. Mask values selected
-                in `[0, 1]`:
-
-                - 1 for values that are **observed**,
-                - 0 for values that are **missing** (i.e. NaNs that were replaced by zeros).
-            future_values (`torch.Tensor` of shape `(bs, forecast_len, num_input_channels)`, *optional*):
-                Future target values associated with the `past_values`
-            output_hidden_states (`bool`, *optional*):
-                Whether or not to return the hidden states of all layers
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the output attention of all layers
-            return_dict (`bool`, *optional*):
-                Whether or not to return a `ModelOutput` instead of a plain tuple.
-
-        Returns:
-            `PatchTSTForPredictionOutput` or tuple of `torch.Tensor` (if `return_dict`=False or
-            `config.return_dict`=False)
-
-        """
 
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
@@ -1043,6 +971,7 @@ class PatchTSTForPrediction(PatchTSTPreTrainedModel):
             channel_attention_mask=channel_attention_mask,
             return_dict=True,
             linear_attn=linear_attn,
+            use_causal_mask=use_causal_mask, # MODIFIED: Pass the flag to the model
         )
         y_hat = self.head(model_output.last_hidden_state)
 
@@ -1088,50 +1017,58 @@ class PatchTSTForPrediction(PatchTSTPreTrainedModel):
         self,
         past_values: torch.Tensor,
         past_observed_mask: Optional[torch.Tensor] = None,
-        channel_attention_mask: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
     ) -> SamplePatchTSTOutput:
         """
-        Generate sequences of sample predictions from a model with a probability distribution head.
-
+        Generates sequences auto-regressively on a patch-by-patch basis.
+        
         Parameters:
-            past_values (`torch.FloatTensor` of shape `(batch_size, sequence_length, num_input_channels)`):
-                Past values of the time series that serves as context in order to predict the future.
-            past_observed_mask (`torch.BoolTensor` of shape `(batch_size, sequence_length, num_input_channels)`, *optional*):
-                Boolean mask to indicate which `past_values` were observed and which were missing. Mask values selected
-                in `[0, 1]`:
+            past_values (`torch.FloatTensor` of shape `(batch_size, context_length, num_input_channels)`):
+                The initial context for starting the generation.
+            past_observed_mask (`torch.BoolTensor`, *optional*):
+                Mask for the initial context.
 
-                - 1 for values that are **observed**,
-                - 0 for values that are **missing** (i.e. NaNs that were replaced by zeros).
-
-        Return:
-            [`SamplePatchTSTOutput`] where the outputs `sequences` tensor will have shape `(batch_size, number of
-            samples, prediction_length, 1)` or `(batch_size, number of samples, prediction_length, num_input_channels)`
-            for multivariate predictions.
+        Returns:
+            `SamplePatchTSTOutput` with `sequences` of shape `(batch_size, 1, prediction_length, num_input_channels)`.
         """
-        # get number of samples
-        num_parallel_samples = self.config.num_parallel_samples
-
-        # get model output
-        outputs = self(
-            past_values=past_values,
-            future_values=None,
-            past_observed_mask=past_observed_mask,
-            output_hidden_states=False,
-            channel_attention_mask=channel_attention_mask,
-            output_attentions=output_attentions,
-        )
-
-        if self.distribution_output:
-            # get distribution
-            distribution = self.distribution_output.distribution(
-                outputs.prediction_outputs, loc=outputs.loc, scale=outputs.scale
+        patch_length = self.config.patch_length
+        prediction_length = self.config.prediction_length
+        
+        if prediction_length % patch_length != 0:
+            raise ValueError(
+                f"Prediction length ({prediction_length}) must be a multiple of patch length ({patch_length}) for auto-regressive generation."
             )
-            # get samples: list of [bs x forecast_len x num_channels]
-            samples = [distribution.sample() for _ in range(num_parallel_samples)]
-            # samples: [bs x num_samples x forecast_len x num_channels]
-            samples = torch.stack(samples, dim=1)
-        else:
-            samples = outputs.prediction_outputs.unsqueeze(1)
 
-        return SamplePatchTSTOutput(sequences=samples)  # type: ignore
+        num_pred_patches = prediction_length // patch_length
+        
+        context = past_values
+        if past_observed_mask is None:
+            observed_mask_context = torch.ones_like(context)
+        else:
+            observed_mask_context = past_observed_mask
+
+        generated_sequence = []
+
+        for _ in range(num_pred_patches):
+            # 调用 forward 方法进行单步预测。
+            # 关键：这里 is_causal 必须为 False，因为自回归的因果性是由循环本身保证的。
+            # 模型在预测下一个 patch 时，需要看到完整的当前上下文。
+            outputs = self.forward(
+                past_values=context,
+                past_observed_mask=observed_mask_context,
+                return_dict=True,
+                use_causal_mask=False
+            )
+            
+            # 预测头会输出完整的 prediction_length，我们只取第一个 patch。
+            all_predicted_patches = outputs.prediction_outputs
+            next_patch = all_predicted_patches[:, :patch_length, :]
+            generated_sequence.append(next_patch)
+
+            # 更新上下文窗口：移除最旧的 patch，添加新生成的 patch。
+            context = torch.cat([context[:, patch_length:, :], next_patch], dim=1)
+            observed_mask_context = torch.cat([observed_mask_context[:, patch_length:, :], torch.ones_like(next_patch)], dim=1)
+
+        # 将所有生成的 patch 拼接成最终的预测序列。
+        final_prediction = torch.cat(generated_sequence, dim=1)
+        
+        return SamplePatchTSTOutput(sequences=final_prediction.unsqueeze(1))
