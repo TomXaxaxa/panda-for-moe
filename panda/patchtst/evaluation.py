@@ -1,3 +1,6 @@
+import os
+from datetime import datetime
+
 from collections import defaultdict
 from typing import Callable
 
@@ -192,6 +195,8 @@ def evaluate_forecasting_model(
     system_labels = {}
     system_metrics = defaultdict(dict)
     prediction_kwargs = prediction_kwargs or {}
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     if eval_subintervals is None:
         eval_subintervals = [(0, prediction_length)]
@@ -268,6 +273,27 @@ def evaluate_forecasting_model(
 
             # shape: (num_eval_windows * num_datasets, context_length, num_channels)
             contexts = np.concatenate(contexts, axis=0)
+            
+            # save_dir = './predictions/decoder64/'
+            # 
+            # if save_dir:
+            #     # 确保保存目录存在
+            #     os.makedirs(save_dir, exist_ok=True)
+# 
+            #     # 构建带有时间戳和系统名称的文件路径
+            #     # `labels` 是真实值 (trues)
+            #     true_filepath = os.path.join(save_dir, f"{timestamp}_{system}_trues.npy")
+            #     # `predictions` 是预测值 (preds)
+            #     pred_filepath = os.path.join(save_dir, f"{timestamp}_{system}_preds.npy")
+# 
+            #     # 使用 numpy.save 保存数组
+            #     np.save(true_filepath, labels)
+            #     np.save(pred_filepath, predictions)
+# 
+            #     # 打印提示信息，方便追踪
+            #     print(f"\nSaved data for system '{system}':")
+            #     print(f"  - Ground truth (trues) saved to: {true_filepath}")
+            #     print(f"  - Predictions (preds) saved to: {pred_filepath}")
 
             # evaluate metrics for multiple forecast lengths on user-specified subintervals
             # as well as the full prediction length interval

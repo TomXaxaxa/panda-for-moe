@@ -24,7 +24,7 @@ from transformers.models.patchtst.modeling_patchtst import (
 )
 from transformers.utils import ModelOutput
 
-from ..panda.patchtst.modules import (
+from .modules import (
     DyT,
     PatchTSTKernelEmbedding,
     PatchTSTPatchify,
@@ -32,6 +32,35 @@ from ..panda.patchtst.modules import (
     apply_p_rope_to_qk,
 )
 
+from .deepseek_moe import DeepseekMoE
+
+class PatchTSTMoEWrapper(nn.Module):
+    def __init__(self, config: PatchTSTConfig):
+        super().__init__()
+        
+        class MockDeepseekConfig:
+            def __init__(self, patchtst_config):
+                self.hidden_size = patchtst_config.d_model
+                self.intermediate_size = patchtst_config.ffn_dim
+                self.hidden_act = patchtst_config.activation_function
+                
+                self.n_routed_experts = getattr(patchtst_config, "n_routed_experts", 8)
+                self.num_experts_per_tok = getattr(patchtst_config, "num_experts_per_tok", 2)
+                self.moe_intermediate_size = getattr(patchtst_config, "moe_intermediate_size", 1024)
+                
+                self.n_shared_experts = getattr(patchtst_config, "n_shared_experts", 0)
+                
+                self.scoring_func = getattr(patchtst_config, "scoring_func", "softmax")
+                self.aux_loss_alpha = getattr(patchtst_config, "aux_loss_alpha", 0.01)
+                self.seq_aux = getattr(patchtst_config, "seq_aux", False)
+                self.norm_topk_prob = getattr(patchtst_config, "norm_topk_prob", True)
+
+        mock_config = MockDeepseekConfig(config)
+        
+        self.moe_layer = DeepseekMoE(mock_config)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.moe_layer(hidden_states)
 
 @dataclass
 class CompletionsPatchTSTOutput(ModelOutput):
@@ -329,12 +358,22 @@ class PatchTSTEncoderLayerWithRope(nn.Module):
                 )
 
         # Position-wise Feed-Forward
-        self.ff = nn.Sequential(
-            nn.Linear(config.d_model, config.ffn_dim, bias=config.bias),
-            ACT2CLS[config.activation_function](),
-            nn.Dropout(config.ff_dropout) if config.ff_dropout > 0 else nn.Identity(),
-            nn.Linear(config.ffn_dim, config.d_model, bias=config.bias),
-        )
+        # self.ff = nn.Sequential(
+        #     nn.Linear(config.d_model, config.ffn_dim, bias=config.bias),
+        #     ACT2CLS[config.activation_function](),
+        #     nn.Dropout(config.ff_dropout) if config.ff_dropout > 0 else nn.Identity(),
+        #     nn.Linear(config.ffn_dim, config.d_model, bias=config.bias),
+        # )
+        
+        if getattr(config, "n_routed_experts", 0) > 0:
+            self.ff = PatchTSTMoEWrapper(config)
+        else:
+            self.ff = nn.Sequential(
+                nn.Linear(config.d_model, config.ffn_dim, bias=config.bias),
+                ACT2CLS[config.activation_function](),
+                nn.Dropout(config.ff_dropout) if config.ff_dropout > 0 else nn.Identity(),
+                nn.Linear(config.ffn_dim, config.d_model, bias=config.bias),
+            )
 
         # Add & Norm of sublayer 3
         self.dropout_path3 = (

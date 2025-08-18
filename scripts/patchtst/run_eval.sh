@@ -1,7 +1,7 @@
 #!/bin/bash
 main_dir=$(cd "$(dirname "$0")/../.." && pwd)
 echo "main_dir: $main_dir"
-checkpoint_dir="./checkpoints/panda256+encoder+Deepseek-MOE/checkpoint-final"
+checkpoint_dir="./checkpoints/panda256+encoder+Moirai-MOE/checkpoint-final"
 
 ulimit -n 99999
 
@@ -67,7 +67,7 @@ ulimit -n 99999
 # echo "run_names: ${run_names[@]}"
 
 test_data_dirs=(
-    ./data/new_skew40/test_mini
+    ./data/new_skew40/test
 )
 
 # --- START: Modified section (replaces jq) ---
@@ -99,9 +99,9 @@ python scripts/patchtst/evaluate.py \
     eval.context_length=512 \
     eval.prediction_length=512 \
     eval.limit_prediction_length=false \
-    eval.metrics_save_dir=./eval_results/patchtst/tmp/test_example \
+    eval.metrics_save_dir=./eval_results/patchtst/panda256+Moirai-MoE/test_example \
     eval.metrics_fname=metrics \
     eval.overwrite=true \
-    eval.device=cuda:1 \
+    eval.device=cuda:2 \
     eval.save_labels=false \
     eval.save_predictions=false

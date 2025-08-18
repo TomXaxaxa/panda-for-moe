@@ -25,41 +25,74 @@ import torch.distributed as dist
 from panda.utils import is_main_process
 from panda.patchtst.deepseek_moe import MoEGate, DeepseekMLP
 
+from collections import defaultdict
+
+# from panda.patchtst.patchtst import TokenClusterGating
+
 logger = logging.getLogger(__name__)
 log = partial(log_on_main, logger=logger)
 
-def log_moe_stats(model: torch.nn.Module):
-    """
-    聚合（支持DDP）并打印模型中所有MoE层的专家使用情况。
-    """
-    if is_main_process(): # 只在主进程（rank 0）执行打印
-        print("\n" + "="*50)
-        print(" " * 15 + "MoE Expert Usage Report")
-        print("="*50)
-        
-        # 遍历模型找到MoE门
-        for i, module in enumerate(model.modules()):
-            if isinstance(module, MoEGate):
-                # 如果是分布式环境，需要从所有GPU聚合统计数据
-                if dist.is_initialized():
-                    dist.all_reduce(module.expert_usage_count, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(module.total_tokens_routed, op=dist.ReduceOp.SUM)
+ffn_inputs = defaultdict(list)
 
-                if module.total_tokens_routed.item() == 0:
-                    print(f"MoE Layer {i}: No tokens were routed during evaluation. Skipping report.")
-                    continue
-                    
-                usage_percentages = module.expert_usage_count / module.total_tokens_routed.item() * 100
-                
-                print(f"\n--- MoE Layer in module (approx. layer {i//10}) ---") # 提供一个粗略的层位置
-                print(f"Total routing events during evaluation: {module.total_tokens_routed.item()}")
-                for exp_idx in range(module.n_routed_experts):
-                    print(
-                        f"  Expert {exp_idx:02d}: "
-                        f"routed {module.expert_usage_count[exp_idx].item():>8d} times "
-                        f"({usage_percentages[exp_idx]:.2f}%)"
-                    )
-        print("="*50 + "\n")
+def get_ffn_input_hook(layer_idx):
+    """一个工厂函数，创建并返回一个特定于层索引的钩子函数"""
+    def hook(module, input, output):
+        # input是一个元组，我们只需要第一个元素
+        # 我们将其从计算图中分离，并移动到CPU以节省显存
+        ffn_inputs[layer_idx].append(input[0].detach().cpu())
+    return hook
+
+# def log_moe_stats(model: torch.nn.Module):
+#     """
+#     聚合（支持DDP）并打印模型中所有MoE层的专家使用情况。
+#     """
+#     # 确保只在主进程执行打印和聚合后的最终计算
+#     if not is_main_process():
+#         # 在非主进程上，参与all_reduce但之后直接返回
+#         if dist.is_initialized():
+#             for module in model.modules():
+#                 if isinstance(module, TokenClusterGating): # <-- 改动 1
+#                     dist.all_reduce(module.expert_usage_count, op=dist.ReduceOp.SUM)
+#                     dist.all_reduce(module.total_tokens_routed, op=dist.ReduceOp.SUM)
+#         return
+# 
+#     # --- 以下代码仅在主进程上运行 ---
+#     print("\n" + "="*50)
+#     print(" " * 15 + "MoE Expert Usage Report")
+#     print("="*50)
+#     
+#     found_moe_layer = False
+#     # 遍历模型找到MoE门控模块
+#     for i, module in enumerate(model.modules()):
+#         if isinstance(module, TokenClusterGating): # <-- 改动 1
+#             found_moe_layer = True
+#             # 如果是分布式环境，需要从所有GPU聚合统计数据
+#             if dist.is_initialized():
+#                 # 主进程也参与all_reduce
+#                 dist.all_reduce(module.expert_usage_count, op=dist.ReduceOp.SUM)
+#                 dist.all_reduce(module.total_tokens_routed, op=dist.ReduceOp.SUM)
+# 
+#             if module.total_tokens_routed.item() == 0:
+#                 print(f"MoE Gating Layer (approx. module {i}): No tokens were routed during evaluation. Skipping report.")
+#                 continue
+#                 
+#             usage_percentages = module.expert_usage_count.float() / module.total_tokens_routed.item() * 100
+#             
+#             print(f"\n--- MoE Gating Layer (approx. module {i}) ---")
+#             print(f"Total routing events during evaluation: {module.total_tokens_routed.item()}")
+#             
+#             # 使用正确的属性来获取专家数量
+#             for exp_idx in range(module.num_experts): # <-- 改动 2
+#                 print(
+#                     f"  Expert {exp_idx:02d}: "
+#                     f"routed {module.expert_usage_count[exp_idx].item():>8d} times "
+#                     f"({usage_percentages[exp_idx]:.2f}%)"
+#                 )
+#     
+#     if not found_moe_layer:
+#         print("No MoE Gating layers (TokenClusterGating) found in the model.")
+#         
+#     print("="*50 + "\n")
 
 @hydra.main(config_path="../../config", config_name="config", version_base=None)
 def main(cfg):
@@ -140,6 +173,13 @@ def main(cfg):
             ]
         }
         log(f"dynamics embedding config: {dynamics_embedding_config}")
+
+    # log("为每个Encoder层的FFN模块注册前向钩子以提取表征...")
+    # encoder_layers = pipeline.model.model.encoder.layers
+    # for i, layer in enumerate(encoder_layers):
+    #     # 将钩子注册在ff模块上
+    #     layer.ff.register_forward_hook(get_ffn_input_hook(i))
+    #     log(f"  已为第 {i} 层注册钩子。")
 
     pipeline.model.eval()
 
@@ -266,9 +306,29 @@ def main(cfg):
     else:
         raise ValueError(f"Invalid eval mode: {cfg.eval.mode}")
     
-    log("Logging MoE statistics...")
-    log_moe_stats(pipeline.model)
+    # log("处理并保存收集到的FFN输入表征...")
+    # final_representations = {}
+    # for layer_idx, tensor_list in ffn_inputs.items():
+    #     if not tensor_list:
+    #         log(f"警告：第 {layer_idx} 层未收集到任何表征。")
+    #         continue
+    #     
+    #     # 将所有批次的张量拼接成一个大张量
+    #     log(f"  正在拼接第 {layer_idx} 层的 {len(tensor_list)} 个张量批次...")
+    #     # PatchTST的FFN输入是3D的: (batch*channels, patches, d_model)
+    #     # 我们需要将前两个维度合并以进行聚类
+    #     concatenated_tensor = torch.cat(tensor_list, dim=0).view(-1, pipeline.model.config.d_model)
+    #     final_representations[layer_idx] = concatenated_tensor
+    #     log(f"  第 {layer_idx} 层最终表征形状: {concatenated_tensor.shape}")
+# 
+    # # 保存到文件
+    # output_path = "ffn_representations.pt"
+    # torch.save(final_representations, output_path)
+    # log(f"所有层的令牌表征已成功保存到: {output_path}")
+    # ======================== 新代码结束 ========================
 
+    # log("Logging MoE statistics...")
+    # log_moe_stats(pipeline.model)
 
 if __name__ == "__main__":
     main()

@@ -43,13 +43,13 @@ if [ "$DEBUG" -eq 0 ]; then
         CORES_PER_GROUP=$(( $TOTAL_CORES / 2 ))
         CORES_PER_JOB=$(( $CORES_PER_GROUP / 4 ))
 
-        CUDA_DEVICES=4,5,6,7
+        CUDA_DEVICES=0,1,2
         # CUDA_DEVICES=4,5,6,7
         NUM_DEVICES=$(echo "$CUDA_DEVICES" | tr -d ' ' | tr ',' '\n' | wc -l)
 
         CUDA_VISIBLE_DEVICES=$CUDA_DEVICES OMP_NUM_THREADS=$CORES_PER_JOB torchrun \
                 --nproc-per-node $NUM_DEVICES \
-                --master-port 29508 \
+                --master-port 29503 \
                 scripts/patchtst/train.py \
                 shuffle_buffer_length=100_000 \
                 train_data_dirs=$train_data_dirs_json \

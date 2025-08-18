@@ -9,7 +9,7 @@ def create_dummy_data(base_dir, models):
     为测试目的创建虚拟文件结构和数据。
     如果您的真实数据已存在，可以跳过或注释掉对此函数的调用。
     """
-    print("正在为演示创建虚拟数据...")
+    print(f"正在为演示创建虚拟数据，模型: {models}...")
     pred_steps = [64, 128, 192, 256, 320, 384, 448, 512]
     
     for model in models:
@@ -43,25 +43,37 @@ def create_dummy_data(base_dir, models):
     print("虚拟数据创建完成。")
 
 
-def analyze_and_plot(base_dir='eval_results/patchtst'):
+def analyze_and_plot(base_dir='eval_results/patchtst', models_to_plot=None):
     """
     分析指定目录中的实验结果并生成图表。
+
+    Args:
+        base_dir (str, optional): 包含模型结果的根目录。
+                                  默认为 'eval_results/patchtst'。
+        models_to_plot (list, optional): 一个字符串列表，指定要绘制哪些模型。
+                                         如果为 None，则自动检测 `base_dir` 下的所有模型。
+                                         默认为 None。
     """
     base_path = Path(base_dir)
 
-    models = [
-        'Mamba256+MoE+SE',
-        'Mamba256+SE'
-    ]
-    models.sort()
-
-    if not base_path.exists():
-        print(f"错误：目录 '{base_dir}' 不存在。正在创建虚拟数据...")
-        # 为了更好地演示symlog，修改了虚拟数据生成
-        create_dummy_data(base_path, models)
+    if models_to_plot:
+        models = sorted(models_to_plot)
+        print(f"将分析指定模型: {models}")
+    else:
+        print(f"正在自动检测 '{base_dir}' 下的模型...")
+        try:
+            models = sorted([d.name for d in base_path.iterdir() if d.is_dir()])
+            if not models:
+                print(f"在 '{base_dir}' 中未找到任何模型目录。")
+                raise FileNotFoundError
+            print(f"检测到模型: {models}")
+        except FileNotFoundError:
+            print(f"错误：目录 '{base_dir}' 不存在或为空。")
+            default_models_for_demo = ['Mamba256+MoE+SE', 'Mamba256+SE', 'Another_Model']
+            create_dummy_data(base_path, default_models_for_demo)
+            models = default_models_for_demo
 
     metrics_to_plot = ['mse', 'mae', 'smape', 'spearman']
-    
     all_results = []
     
     for model_name in models:
@@ -78,14 +90,29 @@ def analyze_and_plot(base_dir='eval_results/patchtst'):
                 
                 for metric in metrics_to_plot:
                     if metric in df.columns:
+                        
+                        # --- 关键修改开始 ---
+                        # 如果指标是 'mse' 或 'mae'，则排除前10%的极端值
+                        if metric in ['mse', 'mae']:
+                            # 计算要保留的行数（底部90%）
+                            n_rows_to_keep = int(len(df) * 0.85)
+                            
+                            # 对值进行排序，并选择最小的90%
+                            sorted_values = df[metric].sort_values()
+                            mean_val = sorted_values.iloc[:n_rows_to_keep].mean()
+                        else:
+                            # 对于其他指标，正常计算均值
+                            mean_val = df[metric].mean()
+                        # --- 关键修改结束 ---
+                            
                         all_results.append({
                             'model': model_name, 
                             'pred_steps': pred_steps,
                             'metric': metric,
-                            'median': df[metric].median()
+                            'mean': mean_val  # 使用新计算的均值
                         })
                     else:
-                        if pred_steps == 64 and model_name == models[0]:
+                        if pred_steps == sorted(model_path.glob('metrics_pred*.csv'))[0] and model_name == models[0]:
                             print(f"警告：指标 '{metric}' 在 {csv_file} 中未找到，将被跳过。")
             except Exception as e:
                 print(f"处理文件 '{csv_file}' 时出错: {e}")
@@ -96,7 +123,7 @@ def analyze_and_plot(base_dir='eval_results/patchtst'):
 
     results_df = pd.DataFrame(all_results)
 
-    # 绘图部分
+    # --- 绘图部分 (未修改) ---
     try:
         plt.rcParams['font.family'] = 'serif'
         plt.rcParams['font.serif'] = 'Times New Roman'
@@ -106,13 +133,10 @@ def analyze_and_plot(base_dir='eval_results/patchtst'):
         print("未找到 Times New Roman 字体，将使用默认 serif 字体。")
 
     fig, axes = plt.subplots(2, 2, figsize=(18, 12), sharex=True)
-    # --- 修改: 更新图表标题以反映symlog尺度 ---
-    fig.suptitle('Model Performance Comparison (Median Trend on Symlog Scale)', fontsize=22, fontname='Times New Roman')
+    fig.suptitle('Model Performance Comparison (Mean Trend on Linear Scale)', fontsize=22, fontname='Times New Roman')
 
-    colors = {
-        'Mamba256+MoE+SE': '#1f77b4',
-        'Mamba256+SE': '#ff7f0e',
-    }
+    colormap = plt.get_cmap('tab10') 
+    color_map = {model: colormap(i) for i, model in enumerate(models)}
     
     unique_pred_steps = sorted(results_df['pred_steps'].unique())
     
@@ -140,23 +164,19 @@ def analyze_and_plot(base_dir='eval_results/patchtst'):
             x_pos = model_data['pred_steps'] + offset
             
             ax.plot(
-                x_pos, model_data['median'],
+                x_pos, model_data['mean'],
                 marker='o',
                 linestyle='--',
                 markersize=8,
                 alpha=0.8,
-                color=colors.get(model_name, 'black'), 
+                color=color_map.get(model_name, 'black'), 
                 label=model_name if i == 0 else ""
             )
 
         ax.set_ylabel(metric.upper(), fontsize=14, fontname='Times New Roman')
         ax.set_title(f'Metric: {metric.upper()}', fontsize=16, fontname='Times New Roman')
         ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-
-        # --- 关键修改 ---
-        # 将Y轴设置为对称对数坐标轴。
-        # linthresh 定义了0点附近线性区域的大小，您可以根据数据分布调整此值。
-        ax.set_yscale('symlog', linthresh=0.1)
+        ax.set_yscale('linear')
 
     for ax in axes[1, :]:
         ax.set_xlabel('Prediction Steps', fontsize=14, fontname='Times New Roman')
@@ -181,9 +201,18 @@ def analyze_and_plot(base_dir='eval_results/patchtst'):
     
     plt.tight_layout(rect=[0, 0.03, 1, 0.94])
     
-    # --- 修改: 保存为新文件名 ---
-    plt.savefig("model_comparison_plot_MoE.png", dpi=300)
+    plt.savefig("model_comparison_plot.png", dpi=300)
     plt.show()
 
 if __name__ == '__main__':
-    analyze_and_plot(base_dir='eval_results/patchtst')
+    # --- 使用方法 ---
+
+    # 示例1: 自动检测 'eval_results/patchtst' 目录下的所有模型
+    # analyze_and_plot(base_dir='eval_results/patchtst')
+
+    # 示例2: 只分析和绘制指定的两个模型
+    models_to_run = ['panda256+encoder', 'panda256+DeepSeek-MoE', 'panda256+Moirai-MoE']
+    analyze_and_plot(base_dir='eval_results/patchtst', models_to_plot=models_to_run)
+    
+    # 示例3: 如果目录不存在，脚本将自动创建包含三个模型的虚拟数据并绘图
+    # analyze_and_plot(base_dir='non_existent_dir/patchtst')
