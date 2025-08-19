@@ -327,8 +327,8 @@ def main(cfg):
     # log(f"所有层的令牌表征已成功保存到: {output_path}")
     # ======================== 新代码结束 ========================
 
-    # log("Logging MoE statistics...")
-    # log_moe_stats(pipeline.model)
+#     log("Logging MoE statistics...")
+#     log_moe_stats(pipeline.model)
 
 if __name__ == "__main__":
     main()

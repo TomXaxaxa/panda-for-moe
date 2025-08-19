@@ -7,8 +7,8 @@ from mpl_toolkits.mplot3d import Axes3D # Required for 3D plotting
 
 # --- 1. Configuration Area ---
 # Please modify these two paths
-INPUT_DATA_DIR = "./predictions/decoder64"  # 存放 .npy 文件的文件夹
-PLOT_OUTPUT_DIR = "./plots/decoder64"     # 保存生成图像的文件夹
+INPUT_DATA_DIR = "./predictions/TimesFM"  # 存放 .npy 文件的文件夹
+PLOT_OUTPUT_DIR = "./plots/TimesFM"     # 保存生成图像的文件夹
 # -----------------------------
 
 
