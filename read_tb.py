@@ -11,16 +11,12 @@ import os
 # - 'path': 该模型 TensorBoard 日志文件所在的【目录】路径
 model_logs = [
     {
-        "name": "Transformer-512",
-        "path": "./checkpoints/panda512+encoder/logs"  # <-- ‼️ 修改为您的第一个模型的日志目录
+        "name": "panda256",
+        "path": "./checkpoints/panda256+encoder/logs"  # <-- ‼️ 修改为您的第一个模型的日志目录
     },
     {
-        "name": "Mamba-512",
-        "path": "./checkpoints/Mamba512*2_1024/logs"  # <-- ‼️ 修改为您的第二个模型的日志目录
-    },
-    {
-        "name": "Moirai-MoE",
-        "path": "./checkpoints/panda512+encoder+Moirai-MOE/logs"  # <-- ‼️ 修改为您的第二个模型的日志目录
+        "name": "panda256+FlashAttention",
+        "path": "./checkpoints/panda256+encoder+FlashAttention/logs" # <-- ‼️ 修改为您的第二个模型的日志目录
     }
     # 如果有更多模型，请像下面这样继续添加
     # {

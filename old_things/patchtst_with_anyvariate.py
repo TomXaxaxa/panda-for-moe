@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
-import math
 import torch
 import torch.nn as nn
 from mamba_ssm import Mamba2
@@ -33,170 +32,6 @@ from .modules import (
     apply_p_rope_to_qk,
 )
 
-# ==========================================================================================
-# ================================ 新增 Koopa 核心模块 =======================================
-# ==========================================================================================
-
-# 模块1: 动态傅里叶滤波器
-class FourierFilter(nn.Module):
-    """
-    根据您的要求 [将模型分解为低频部分和高频部分]，实现动态傅里叶滤波器。
-    它会根据 [能量占比的方式选取低频谱] [要求 1]，对每个批次的数据进行实时划分。
-    """
-    def __init__(self, energy_percent=0.8):
-        super(FourierFilter, self).__init__()
-        if not (0 < energy_percent < 1):
-            raise ValueError("energy_percent must be between 0 and 1.")
-        self.energy_percent = energy_percent
-
-    def forward(self, x):
-        # x shape: [Batch, Sequence Length, Channels]
-        # 傅里叶变换和能量计算
-        xf = torch.fft.rfft(x, dim=1)
-        energies = torch.abs(xf) ** 2
-
-        # 排序能量并计算累积能量，以确定低频分量的索引
-        sorted_energies, sorted_indices = torch.sort(energies, dim=1, descending=True)
-        total_energy_per_series = torch.sum(energies, dim=1, keepdim=True)
-        cumulative_energies = torch.cumsum(sorted_energies, dim=1)
-        
-        # 找到达到能量阈值的频率数量 k
-        k = (cumulative_energies > total_energy_per_series * self.energy_percent).float().argmax(dim=1) + 1
-
-        # 创建动态掩码，Koopa论文的逻辑是掩盖掉低频部分来得到高频部分
-        num_frequencies = sorted_indices.shape[1]
-        # arange_f: [1, F, 1]
-        arange_f = torch.arange(num_frequencies, device=x.device).view(1, -1, 1)
-
-        # rank_tensor: [B, F, C] 表示每个频率的能量排名
-        rank_tensor = torch.empty_like(sorted_indices)
-        rank_tensor.scatter_(1, sorted_indices, arange_f.expand_as(sorted_indices))
-
-        # is_low_freq: [B, F, C] 布尔张量，能量排在k之前的为True
-        # k.unsqueeze(1): [B, 1, C]
-        is_low_freq = rank_tensor < k.unsqueeze(1)
-
-        # 创建掩码，将低频部分置为0
-        mask = torch.ones_like(xf, device=x.device)
-        mask[is_low_freq] = 0
-        
-        # 应用掩码分离高低频
-        # x_var 是高频部分 (time-variant)
-        x_var = torch.fft.irfft(xf * mask, n=x.shape[1], dim=1)
-        # x_inv 是低频部分 (time-invariant)，通过从原始信号中减去高频部分得到
-        x_inv = x - x_var
-        
-        return x_var, x_inv
-
-# 模块2: MLP (多层感知机)
-class MLP(nn.Module):
-    """
-    通用MLP模块，用于 [高频部分的Koopman网络实现] [要求 2] 中的编码器和解码器。
-    """
-    def __init__(self, f_in, f_out, hidden_dim=128, hidden_layers=2, dropout=0.05, activation='tanh'):
-        super(MLP, self).__init__()
-        self.activation = nn.Tanh() if activation == 'tanh' else nn.ReLU()
-        layers = [nn.Linear(f_in, hidden_dim), self.activation, nn.Dropout(dropout)]
-        for _ in range(hidden_layers - 2):
-            layers += [nn.Linear(hidden_dim, hidden_dim), self.activation, nn.Dropout(dropout)]
-        layers += [nn.Linear(hidden_dim, f_out)]
-        self.layers = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.layers(x)
-
-# 模块3: Koopman预测层 (KPLayer)
-class KPLayer(nn.Module):
-    """
-    Koopman预测层，使用Moore-Penrose伪逆计算Koopman矩阵，
-    并实现了您要求的 [有界性约束] [要求 3]。
-    """
-    def __init__(self):
-        super(KPLayer, self).__init__()
-        self.K = None
-
-    def forward(self, z, pred_len=1):
-        B, input_len, E = z.shape
-        x, y = z[:, :-1], z[:, 1:]
-        
-        # --- 临时注释掉瓶颈代码 ---
-        # self.K = torch.linalg.lstsq(x, y).solution
-        # with torch.no_grad():
-        #     eigenvalues = torch.linalg.eigvals(self.K)
-        #     max_abs_eig = torch.abs(eigenvalues).max(dim=-1).values
-        #     scaling_factor = torch.clamp(max_abs_eig, min=1.0).unsqueeze(-1).unsqueeze(-1)
-        # self.K = self.K / scaling_factor
-
-        # --- 用一个简单的随机矩阵代替K ---
-        self.K = torch.randn(B, E, E, device=z.device)
-
-        # 使用约束后的 K 进行预测
-        z_pred = torch.bmm(z[:, -1:], self.K)
-        z_preds = [z_pred]
-        for _ in range(1, pred_len):
-            z_pred = torch.bmm(z_pred, self.K)
-            z_preds.append(z_pred)
-        
-        return torch.cat(z_preds, dim=1)
-
-# 模块4: 时间可变 Koopman 预测器 (TimeVarKP) - 修正版
-class TimeVarKP(nn.Module):
-    """
-    实现了您要求的 [高频部分的Koopman网络实现] [要求 2]，
-    参考 "Koopa" 的 Time-Variant KP 实现。
-    此版本已修正，不再依赖外部 enc_in 参数，而是根据输入动态适应。
-    """
-    def __init__(self, input_len, pred_len, seg_len, dynamic_dim, encoder, decoder):
-        super(TimeVarKP, self).__init__()
-        self.input_len = input_len
-        self.pred_len = pred_len
-        self.seg_len = seg_len
-        # self.enc_in 不再需要
-        self.encoder, self.decoder = encoder, decoder
-        self.freq = math.ceil(self.input_len / self.seg_len)
-        self.step = math.ceil(self.pred_len / self.seg_len)
-        self.padding_len = self.seg_len * self.freq - self.input_len
-        self.dynamics = KPLayer()
-
-    def forward(self, x):
-        # x 原始形状: [B, L, C]
-        B, L, C = x.shape
-
-        # --- 修改开始：实现通道独立的计算 ---
-        # 1. 将多通道数据转换为批次内的单通道数据
-        # [B, L, C] -> [B, C, L] -> [B*C, L, 1]
-        x = x.transpose(1, 2).reshape(B * C, L, 1)
-
-        # 2. 对 [B*C, L, 1] 的数据进行 Koopman 预测
-        # 此处 C_internal 始终为 1
-        B_internal, L_internal, C_internal = x.shape
-
-        # padding, chunking 等操作现在都在 [B*C, L, 1] 的形状上进行
-        current_padding_len = self.seg_len * math.ceil(L_internal / self.seg_len) - L_internal
-        res = torch.cat((x[:, L_internal-current_padding_len:, :], x), dim=1)
-
-        current_freq = math.ceil(res.shape[1] / self.seg_len)
-        res = res.chunk(current_freq, dim=1)
-        # 特征维度现在是 seg_len * 1
-        res = torch.stack(res, dim=1).reshape(B_internal, current_freq, -1)
-
-        res_encoded = self.encoder(res)
-        x_pred_encoded = self.dynamics(res_encoded, self.step)
-
-        x_pred = self.decoder(x_pred_encoded)
-
-        # 3. 将预测结果的形状恢复
-        # x_pred 形状: [B*C, step, seg_len*1] -> [B*C, pred_len_padded, 1]
-        x_pred = x_pred.reshape(B_internal, self.step, self.seg_len, C_internal)
-        x_pred = x_pred.reshape(B_internal, -1, C_internal)[:, :self.pred_len, :]
-
-        # [B*C, pred_len, 1] -> [B, C, pred_len] -> [B, pred_len, C]
-        x_pred = x_pred.reshape(B, C, self.pred_len).transpose(1, 2)
-        # --- 修改结束 ---
-
-        return x_pred
-
-# ================================ 新增模块结束 =========================================
 
 @dataclass
 class CompletionsPatchTSTOutput(ModelOutput):
@@ -424,43 +259,199 @@ class PatchTSTRopeAttention(nn.Module):
 
         return attn_output, attn_weights_reshaped, past_key_value
 
+class AnyVariateAttention(nn.Module):
+    """
+    Multi-headed attention inspired by 'Attention Is All You Need' paper,
+    modified with Any-variate Attention mechanism from MOIRAI paper.
+
+    This implementation combines temporal and channel attention into a single
+    unified mechanism using learnable biases to distinguish between intra-variate
+    and inter-variate attention. It still utilizes rotary positional embeddings (RoPE)
+    for temporal information.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        is_decoder: bool = False,
+        bias: bool = True,
+        is_causal: bool = False,
+        use_rope: bool = True,
+        max_wavelength: int = 10000,
+        rope_percent: float = 0.5,
+        config: Optional[PatchTSTConfig] = None,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.head_dim = embed_dim // num_heads
+        self.max_wavelength = max_wavelength
+        self.rope_percent = rope_percent
+        self.use_rope = use_rope
+        self.config = config
+
+        if (self.head_dim * num_heads) != self.embed_dim:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
+                f" and `num_heads`: {num_heads})."
+            )
+        self.scaling = self.head_dim**-0.5
+        self.is_decoder = is_decoder
+        self.is_causal = is_causal
+
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+        # ==================== 新增: Any-variate Attention Biases ====================
+        # 为每个注意力头添加两个可学习的偏差参数
+        # 维度为 (num_heads, 2)，其中:
+        # - 第0列 (u^1) 用于变量内部 (m=n) 的注意力
+        # - 第1列 (u^2) 用于变量之间 (m!=n) 的注意力
+        self.attention_biases = nn.Parameter(torch.zeros(self.num_heads, 2))
+        # ========================================================================
+
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return (
+            tensor.view(bsz, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+            .contiguous()
+        )
+
+    def get_seq_pos(self, seq_len, device, dtype, offset=0):
+        return torch.arange(seq_len, device=device, dtype=dtype) + offset
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        num_channels: int,                   # 新增参数，用于构建偏差
+        sequence_length: int,                # 新增参数，用于构建偏差
+        key_value_states: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        layer_head_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+        linear_attn: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """Input shape: Batch x (Channel * Time) x HiddenDim"""
+
+        is_cross_attention = key_value_states is not None
+        bsz, total_len, _ = hidden_states.size()
+        tgt_len = total_len # In self-attention, tgt_len is the same as total_len
+
+        # get query proj
+        query_states = self.q_proj(hidden_states) * self.scaling
+        
+        if is_cross_attention or past_key_value is not None:
+             raise NotImplementedError("Cross-attention and past_key_value are not supported in this custom implementation.")
+        else:
+            # self_attention
+            key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
+            value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
+
+        proj_shape = (bsz * self.num_heads, -1, self.head_dim)
+        query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
+        key_states = key_states.reshape(*proj_shape)
+        value_states = value_states.reshape(*proj_shape)
+        src_len = key_states.size(1)
+
+        if self.use_rope:
+            position_ids = self.get_seq_pos(
+                src_len, key_states.device, key_states.dtype
+            )
+            key_states, query_states = apply_p_rope_to_qk(
+                key_states,
+                query_states,
+                position_ids,
+                self.head_dim,
+                self.max_wavelength,
+                self.rope_percent,
+            )
+
+        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+
+        # ==================== 修改: 应用Any-variate Attention偏差 ====================
+        # 1. 创建变量偏差掩码 (variate bias mask)
+        # 创建一个ID张量，用于标识每个token属于哪个通道
+        # e.g., for 3 channels and seq_len 4: [0,0,0,0, 1,1,1,1, 2,2,2,2]
+        variate_ids = torch.arange(total_len, device=hidden_states.device) // sequence_length
+        
+        # is_same_variate[i, j] = 1.0 if token i and j are from the same channel
+        is_same_variate = (variate_ids.unsqueeze(1) == variate_ids.unsqueeze(0)).float()
+
+        # 从学习参数中获取偏差值
+        bias_same = self.attention_biases[:, 0].view(1, self.num_heads, 1, 1) # u^1
+        bias_diff = self.attention_biases[:, 1].view(1, self.num_heads, 1, 1) # u^2
+        
+        # 构建最终的偏差张量，形状: (1, num_heads, total_len, total_len)
+        # 以便广播到 (bsz, num_heads, total_len, total_len)
+        variate_bias = is_same_variate * bias_same + (1 - is_same_variate) * bias_diff
+        
+        # 2. 将偏差应用到注意力权重上
+        attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+        attn_weights = attn_weights + variate_bias
+        attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+        # =========================================================================
+
+        # ... (后续代码基本保持不变, 注意attention_mask的处理) ...
+        if attention_mask is not None:
+            # The original attention_mask is for channels. We don't use it here.
+            # A new mask for the flattened sequence would be needed if masking is required.
+            pass
+
+        if not linear_attn:
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+
+        if output_attentions:
+            attn_weights_reshaped = attn_weights.view(
+                bsz, self.num_heads, tgt_len, src_len
+            )
+        else:
+            attn_weights_reshaped = None
+
+        attn_probs = nn.functional.dropout(
+            attn_weights, p=self.dropout, training=self.training
+        )
+
+        attn_output = torch.bmm(attn_probs, value_states)
+
+        attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
+        attn_output = attn_output.transpose(1, 2)
+        attn_output = attn_output.reshape(bsz, tgt_len, self.embed_dim)
+
+        attn_output = self.out_proj(attn_output)
+
+        # In this simplified implementation, we don't handle past_key_value
+        return attn_output, attn_weights_reshaped, None
 
 class PatchTSTEncoderLayerWithRope(nn.Module):
     """
-    PatchTST encoder layer with rope positional embeddings
+    PatchTST encoder layer modified to use a unified AnyVariateAttention mechanism.
+    This layer flattens the channel and time dimensions to allow the attention
+    module to learn interactions across all tokens simultaneously.
     """
 
     def __init__(self, config: PatchTSTConfig):
         super().__init__()
-
-        self.channel_attention = config.channel_attention
-        # Multi-Head attention
-        self.temporal_self_attn = PatchTSTRopeAttention(
+        
+        # ==================== 修改: 使用新的AnyVariateAttention ====================
+        # 使用我们新创建的AnyVariateAttention模块
+        self.self_attn = AnyVariateAttention(
             embed_dim=config.d_model,
             num_heads=config.num_attention_heads,
             dropout=config.attention_dropout,
             use_rope=True,
             max_wavelength=config.max_wavelength,
             rope_percent=config.rope_percent,
+            config=config,
         )
-        # self.temporal_mamba = Mamba2(
-        #     d_model=config.d_model,
-        #     d_state=1024,
-        #     d_conv=4,
-        #     expand=2,
-        #     headdim=64
-        # )
-        if self.channel_attention:
-            self.channel_self_attn = PatchTSTRopeAttention(
-                embed_dim=config.d_model,
-                num_heads=config.num_attention_heads,
-                dropout=config.attention_dropout,
-                use_rope=config.channel_rope,  # channels are not positional
-                max_wavelength=config.max_wavelength,
-                rope_percent=config.rope_percent,
-            )
+        # =========================================================================
 
-        # Add & Norm of the sublayer 1
+        # Add & Norm for the attention sublayer
         self.dropout_path1 = (
             nn.Dropout(config.path_dropout)
             if config.path_dropout > 0
@@ -474,24 +465,12 @@ class PatchTSTEncoderLayerWithRope(nn.Module):
             self.norm_sublayer1 = DyT(config.d_model)
         else:
             raise ValueError(f"{config.norm_type} is not a supported norm layer type.")
-
-        # Add & Norm of the sublayer 2
-        if self.channel_attention:
-            self.dropout_path2 = (
-                nn.Dropout(config.path_dropout)
-                if config.path_dropout > 0
-                else nn.Identity()
-            )
-            if config.norm_type == "rmsnorm":
-                self.norm_sublayer2 = PatchTSTRMSNorm(config.d_model, config.norm_eps)
-            elif config.norm_type == "layernorm":
-                self.norm_sublayer2 = nn.LayerNorm(config.d_model, eps=config.norm_eps)
-            elif config.norm_type == "dyt":
-                self.norm_sublayer2 = DyT(config.d_model)
-            else:
-                raise ValueError(
-                    f"{config.norm_type} is not a supported norm layer type."
-                )
+        
+        # ==================== 移除: Channel Attention相关代码 ====================
+        # channel_attention 逻辑已被统一到AnyVariateAttention中，故移除
+        self.channel_attention = False # Hardcode to false for clarity
+        # self.channel_self_attn, self.dropout_path2, self.norm_sublayer2 均被移除
+        # =======================================================================
 
         # Position-wise Feed-Forward
         self.ff = nn.Sequential(
@@ -501,7 +480,7 @@ class PatchTSTEncoderLayerWithRope(nn.Module):
             nn.Linear(config.ffn_dim, config.d_model, bias=config.bias),
         )
 
-        # Add & Norm of sublayer 3
+        # Add & Norm for the FFN sublayer
         self.dropout_path3 = (
             nn.Dropout(config.path_dropout)
             if config.path_dropout > 0
@@ -522,127 +501,62 @@ class PatchTSTEncoderLayerWithRope(nn.Module):
         self,
         hidden_state: torch.Tensor,
         output_attentions: Optional[bool] = None,
-        channel_attention_mask: Optional[torch.Tensor] = None,
+        channel_attention_mask: Optional[torch.Tensor] = None, # This will be ignored
         linear_attn: bool = False,
     ):
         """
         Parameters:
-            hidden_state (`torch.Tensor` of shape `(batch_size, num_channels, sequence_length, d_model)`, *required*):
-                Past values of the time series
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the output attention of all layers
+            hidden_state (`torch.Tensor` of shape `(batch_size, num_channels, sequence_length, d_model)`):
+                Input tensor from the previous layer.
         Return:
-            `torch.Tensor` of shape `(batch_size, num_channels, sequence_length, d_model)`
-
+            Tuple of `torch.Tensor`
         """
         batch_size, num_input_channels, sequence_length, d_model = hidden_state.shape
 
-        # First sublayer: attention across time
-        # hidden_states: [(bs*num_channels) x sequence_length x d_model]
-        hidden_state = hidden_state.view(
-            batch_size * num_input_channels, sequence_length, d_model
+        # ==================== 修改: 统一注意力流程 ====================
+        
+        # 1. 扁平化处理：将通道和时间维度合并
+        # [bs x num_channels x seq_len x d_model] -> [bs x (num_channels * seq_len) x d_model]
+        flattened_hidden_state = hidden_state.view(batch_size, num_input_channels * sequence_length, d_model)
+
+        # --- Sublayer 1: Unified Self-Attention ---
+        # 2. (可选) Pre-Normalization
+        norm_input = self.norm_sublayer1(flattened_hidden_state) if self.pre_norm else flattened_hidden_state
+        
+        # 3. 调用 AnyVariateAttention
+        attn_output, attn_weights, _ = self.self_attn(
+            hidden_states=norm_input,
+            num_channels=num_input_channels,
+            sequence_length=sequence_length,
+            output_attentions=output_attentions,
+            linear_attn=linear_attn
         )
 
-        if self.pre_norm:
-            ## Norm and Multi-Head attention and Add residual connection
-            attn_output, attn_weights, _ = self.temporal_self_attn(
-                hidden_states=self.norm_sublayer1(hidden_state),
-                output_attentions=output_attentions,
-            )
-            # Add: residual connection with residual dropout
-            hidden_state = hidden_state + self.dropout_path1(attn_output)
-            # mamba_input = self.norm_sublayer1(hidden_state)
-            # mamba_output = self.temporal_mamba(mamba_input)
-            # hidden_state = hidden_state + self.dropout_path1(mamba_output)
-        else:
-            ## Multi-Head attention and Add residual connection and Norm - Standard Transformer from BERT
-            attn_output, attn_weights, _ = self.temporal_self_attn(
-                hidden_states=hidden_state,
-                output_attentions=output_attentions,
-                linear_attn=linear_attn,
-            )
-            # hidden_states: [(bs*num_channels) x sequence_length x d_model]
-            hidden_state = self.norm_sublayer1(
-                hidden_state + self.dropout_path1(attn_output)
-            )
-            # mamba_output = self.temporal_mamba(hidden_state)
-            # hidden_state = self.norm_sublayer1(hidden_state + self.dropout_path1(mamba_output))
-            
-        # attn_weights = None
+        # 4. Add & (可选) Post-Normalization
+        residual = flattened_hidden_state + self.dropout_path1(attn_output)
+        flattened_hidden_state = self.norm_sublayer1(residual) if not self.pre_norm else residual
 
-        # hidden_state: [bs x num_channels x sequence_length x d_model]
-        hidden_state = hidden_state.reshape(
-            batch_size, num_input_channels, sequence_length, d_model
-        )
-
-        # second sublayer: attention across variable at any given time
-        if self.channel_attention:
-            # hidden_state: [bs x sequence_length x num_channels x d_model]
-            hidden_state = hidden_state.transpose(2, 1).contiguous()
-            # hidden_state: [(bs*sequence_length) x num_channels x d_model]
-            hidden_state = hidden_state.view(
-                batch_size * sequence_length, num_input_channels, d_model
-            )
-            if self.pre_norm:
-                ## Norm and Multi-Head attention and Add residual connection
-                attn_output, channel_attn_weights, _ = self.channel_self_attn(
-                    hidden_states=self.norm_sublayer2(hidden_state),
-                    output_attentions=output_attentions,
-                    attention_mask=channel_attention_mask,
-                )
-                # Add: residual connection with residual dropout
-                hidden_state = hidden_state + self.dropout_path2(attn_output)
-            else:
-                ## Multi-Head attention and Add residual connection and Norm
-                attn_output, channel_attn_weights, _ = self.channel_self_attn(
-                    hidden_states=hidden_state,
-                    output_attentions=output_attentions,
-                    attention_mask=channel_attention_mask,
-                    linear_attn=linear_attn,
-                )
-                # hidden_states: [(bs*sequence_length) x num_channels x d_model]
-                hidden_state = self.norm_sublayer2(
-                    hidden_state + self.dropout_path2(attn_output)
-                )
-
-            # Reshape hidden state
-            # hidden_state: [bs x sequence_length x num_channels x d_model]
-            hidden_state = hidden_state.reshape(
-                batch_size, sequence_length, num_input_channels, d_model
-            )
-            # hidden_state: [bs x num_channels x sequence_length x d_model]
-            hidden_state = hidden_state.transpose(1, 2).contiguous()
-
-        # Third sublayer: mixing across hidden
-        # hidden_state: [(batch_size*num_channels) x sequence_length x d_model]
-        hidden_state = hidden_state.view(
-            batch_size * num_input_channels, sequence_length, d_model
-        )
-        if self.pre_norm:
-            ## Norm and Position-wise Feed-Forward and Add residual connection
-            # Add: residual connection with residual dropout
-            hidden_state = hidden_state + self.dropout_path3(
-                self.ff(self.norm_sublayer3(hidden_state))
-            )
-        else:
-            ## Position-wise Feed-Forward and Add residual connection and Norm
-            # Add: residual connection with residual dropout
-            hidden_state = self.norm_sublayer3(
-                hidden_state + self.dropout_path3(self.ff(hidden_state))
-            )
-
-        # [bs x num_channels x sequence_length x d_model]
-        hidden_state = hidden_state.reshape(
-            batch_size, num_input_channels, sequence_length, d_model
-        )
+        # --- Sublayer 2: Position-wise Feed-Forward ---
+        # 5. (可选) Pre-Normalization
+        ff_input = self.norm_sublayer3(flattened_hidden_state) if self.pre_norm else flattened_hidden_state
+        
+        # 6. 调用FFN
+        ff_output = self.ff(ff_input)
+        
+        # 7. Add & (可选) Post-Normalization
+        residual = flattened_hidden_state + self.dropout_path3(ff_output)
+        flattened_hidden_state = self.norm_sublayer3(residual) if not self.pre_norm else residual
+        
+        # 8. 将形状恢复
+        # [bs x (num_channels * seq_len) x d_model] -> [bs x num_channels x seq_len x d_model]
+        hidden_state = flattened_hidden_state.view(batch_size, num_input_channels, sequence_length, d_model)
+        
+        # ============================================================= 
 
         outputs = (hidden_state,)
         if output_attentions:
-            outputs += (
-                (attn_weights, channel_attn_weights)
-                if self.channel_attention
-                else (attn_weights,)
-            )
+            # 现在只有一个注意力权重，不再有 channel_attn_weights
+            outputs += (attn_weights,) 
 
         return outputs
 
@@ -1086,126 +1000,178 @@ class PatchTSTForPrediction(PatchTSTPreTrainedModel):
     def __init__(self, config: PatchTSTConfig):
         super().__init__(config)
 
-        # --- 1. 硬编码新增的超参数 [要求 4] ---
-        # 您可以在这里修改这些值进行实验
-        config.energy_percent = 0.8  # 能量占比阈值
-        config.dynamic_dim = 128     # Koopman嵌入维度
-        config.seg_len = 24          # Koopman分段长度
-        config.hidden_dim = 128      # MLP隐藏层维度
-        config.hidden_layers = 2     # MLP隐藏层数量
-        
-        # --- 2. 实例化混合模型所需的所有组件 ---
-        
-        # 实例化动态傅里叶滤波器 [要求 1]
-        self.fourier_filter = FourierFilter(energy_percent=config.energy_percent)
-        
-        # 实例化高频路径的Koopman模块 [要求 2]
-        # 现在，编码器和解码器只处理单通道数据 (通道维度为1)
-        # f_in 和 f_out 不再乘以 config.num_input_channels
-        koopman_encoder = MLP(
-            f_in=config.seg_len * 1,
-            f_out=config.dynamic_dim, activation='tanh',
-            hidden_dim=config.hidden_dim, hidden_layers=config.hidden_layers)
-        koopman_decoder = MLP(
-            f_in=config.dynamic_dim, 
-            f_out=config.seg_len * 1,
-            activation='tanh',
-            hidden_dim=config.hidden_dim, hidden_layers=config.hidden_layers)
-        self.time_var_kp = TimeVarKP(
-            input_len=config.context_length,
-            pred_len=config.prediction_length, 
-            seg_len=config.seg_len,
-            dynamic_dim=config.dynamic_dim, 
-            encoder=koopman_encoder,
-            decoder=koopman_decoder
-        )
-                                     
-        # 实例化低频路径的PatchTST模型
-        self.patchtst_model = PatchTSTModel(config)
-        # 为低频路径创建一个简单的线性预测头
-        self.low_freq_prediction_head = nn.Linear(config.d_model, config.prediction_length)
+        # Turn off masking
+        config.do_mask_input = False
 
-        # 定义损失函数
+        self.model = PatchTSTModel(config)
+
+        if config.loss == "mse" or config.loss == "huber":
+            self.distribution_output = None
+        else:
+            if config.distribution_output == "student_t":
+                self.distribution_output = StudentTOutput(dim=config.prediction_length)
+            elif config.distribution_output == "normal":
+                self.distribution_output = NormalOutput(dim=config.prediction_length)
+            elif config.distribution_output == "negative_binomial":
+                self.distribution_output = NegativeBinomialOutput(
+                    dim=config.prediction_length
+                )
+            else:
+                raise ValueError(
+                    f"Unknown distribution output {config.distribution_output}"
+                )
+
+        self.head = PatchTSTPredictionHead(
+            config, distribution_output=self.distribution_output
+        )
+
         if config.loss == "mse":
             self.loss = nn.MSELoss(reduction="mean")
+        elif config.loss == "huber":
+            self.loss = nn.HuberLoss(reduction="mean", delta=config.huber_delta)
         else:
-            raise ValueError(f"Only MSE loss is supported for this hybrid model.")
-            
+            raise ValueError(f"Unknown loss {config.loss}")
+        # Initialize weights and apply final processing
         self.post_init()
 
     def forward(
         self,
         past_values: torch.Tensor,
+        past_observed_mask: Optional[torch.Tensor] = None,
         future_values: Optional[torch.Tensor] = None,
-        # 其他参数可以保留，但在此实现中未使用
-        **kwargs
+        output_hidden_states: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        channel_attention_mask: Optional[torch.Tensor] = None,
+        return_dict: Optional[bool] = None,
+        linear_attn: bool = False,
     ) -> Union[Tuple, PatchTSTForPredictionOutput]:
+        r"""
+        Parameters:
+            past_values (`torch.Tensor` of shape `(bs, sequence_length, num_input_channels)`, *required*):
+                Input sequence to the model
+            past_observed_mask (`torch.BoolTensor` of shape `(batch_size, sequence_length, num_input_channels)`, *optional*):
+                Boolean mask to indicate which `past_values` were observed and which were missing. Mask values selected
+                in `[0, 1]`:
 
-        # --- 3. 实现双路并行预测的 forward 逻辑 ---
+                - 1 for values that are **observed**,
+                - 0 for values that are **missing** (i.e. NaNs that were replaced by zeros).
+            future_values (`torch.Tensor` of shape `(bs, forecast_len, num_input_channels)`, *optional*):
+                Future target values associated with the `past_values`
+            output_hidden_states (`bool`, *optional*):
+                Whether or not to return the hidden states of all layers
+            output_attentions (`bool`, *optional*):
+                Whether or not to return the output attention of all layers
+            return_dict (`bool`, *optional*):
+                Whether or not to return a `ModelOutput` instead of a plain tuple.
 
-        # 步骤 A: 数据标准化
-        loc = past_values.mean(dim=1, keepdim=True)
-        scale = torch.sqrt(torch.var(past_values, dim=1, keepdim=True, unbiased=False) + 1e-5)
-        scaled_past_values = (past_values - loc) / scale
-        
-        # 步骤 B: 傅里叶动态解耦 [要求 1]
-        # x_var 是高频, x_inv 是低频
-        x_var, x_inv = self.fourier_filter(scaled_past_values)
-        
-        # 步骤 C: 低频路径 (由原PatchTST处理) [要求 1]
-        # 内部处理 patch 化和 embedding
-        patched_x_inv = self.patchtst_model.patchifier(x_inv)
-        encoder_output = self.patchtst_model.encoder(patch_input=patched_x_inv)
-        low_freq_embedding = encoder_output.last_hidden_state
-        # 使用 mean pooling 和线性头进行预测
-        low_freq_pooled = low_freq_embedding.mean(dim=2)
-        low_freq_pred_scaled = self.low_freq_prediction_head(low_freq_pooled).transpose(2, 1)
-        
-        # 步骤 D: 高频路径 (由Koopman网络处理) [要求 2]
-        high_freq_pred_scaled = self.time_var_kp(x_var)
-        
-        # 步骤 E: 融合预测结果并逆标准化
-        y_hat_scaled = low_freq_pred_scaled + high_freq_pred_scaled
-        y_hat = y_hat_scaled * scale + loc
+        Returns:
+            `PatchTSTForPredictionOutput` or tuple of `torch.Tensor` (if `return_dict`=False or
+            `config.return_dict`=False)
 
-        # 步骤 F: 计算损失
+        """
+
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
+
+        # get model output
+        model_output = self.model(
+            past_values=past_values,
+            past_observed_mask=past_observed_mask,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            channel_attention_mask=channel_attention_mask,
+            return_dict=True,
+            linear_attn=linear_attn,
+        )
+        y_hat = self.head(model_output.last_hidden_state)
+
+        if self.distribution_output:
+            y_hat_out = y_hat
+        else:
+            y_hat_out = y_hat * model_output.scale + model_output.loc
+
         loss_val = None
         if future_values is not None:
-            loss_val = self.loss(y_hat, future_values)
-        
+            if self.distribution_output:
+                distribution = self.distribution_output.distribution(
+                    y_hat, loc=model_output.loc, scale=model_output.scale
+                )
+                loss_val = nll(distribution, future_values)
+                loss_val = weighted_average(loss_val)
+            else:
+                loss_val = self.loss(y_hat_out, future_values)
+
+        loc = model_output.loc
+        scale = model_output.scale
+
+        if not return_dict:
+            outputs = (
+                future_values,
+                y_hat_out,
+                loc,
+                scale,
+            ) + model_output[1:-1]
+            outputs = (loss_val,) + outputs if loss_val is not None else outputs
+            return outputs
+
         return PatchTSTForPredictionOutput(
-            loss=loss_val,
-            prediction_outputs=y_hat
+            loss=loss_val,  # type: ignore
+            prediction_outputs=y_hat_out,
+            hidden_states=model_output.hidden_states,
+            attentions=model_output.attentions,
+            loc=loc,
+            scale=scale,
         )
 
     def generate(
         self,
         past_values: torch.Tensor,
-        past_observed_mask: Optional[torch.Tensor] = None, # 注意：此参数在新模型中未使用，但保留以兼容接口
-        channel_attention_mask: Optional[torch.Tensor] = None # 注意：此参数在新模型中未使用，但保留以兼容接口
+        past_observed_mask: Optional[torch.Tensor] = None,
+        channel_attention_mask: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
     ) -> SamplePatchTSTOutput:
         """
-        为我们新的 Koopa-Transformer 混合模型生成确定性预测序列。
-        此版本已根据修改后的 forward 方法进行了简化。
+        Generate sequences of sample predictions from a model with a probability distribution head.
+
+        Parameters:
+            past_values (`torch.FloatTensor` of shape `(batch_size, sequence_length, num_input_channels)`):
+                Past values of the time series that serves as context in order to predict the future.
+            past_observed_mask (`torch.BoolTensor` of shape `(batch_size, sequence_length, num_input_channels)`, *optional*):
+                Boolean mask to indicate which `past_values` were observed and which were missing. Mask values selected
+                in `[0, 1]`:
+
+                - 1 for values that are **observed**,
+                - 0 for values that are **missing** (i.e. NaNs that were replaced by zeros).
+
+        Return:
+            [`SamplePatchTSTOutput`] where the outputs `sequences` tensor will have shape `(batch_size, number of
+            samples, prediction_length, 1)` or `(batch_size, number of samples, prediction_length, num_input_channels)`
+            for multivariate predictions.
         """
-        # 将模型设置为评估模式
-        self.eval()
-        
-        # 在 no_grad 上下文中执行，因为我们只是在进行推理，不需要计算梯度
-        with torch.no_grad():
-            # 调用我们重写过的 forward 方法进行预测
-            # future_values 设为 None，因为这是推理阶段
-            outputs = self.forward(
-                past_values=past_values,
-                future_values=None,
+        # get number of samples
+        num_parallel_samples = self.config.num_parallel_samples
+
+        # get model output
+        outputs = self(
+            past_values=past_values,
+            future_values=None,
+            past_observed_mask=past_observed_mask,
+            output_hidden_states=False,
+            channel_attention_mask=channel_attention_mask,
+            output_attentions=output_attentions,
+        )
+
+        if self.distribution_output:
+            # get distribution
+            distribution = self.distribution_output.distribution(
+                outputs.prediction_outputs, loc=outputs.loc, scale=outputs.scale
             )
+            # get samples: list of [bs x forecast_len x num_channels]
+            samples = [distribution.sample() for _ in range(num_parallel_samples)]
+            # samples: [bs x num_samples x forecast_len x num_channels]
+            samples = torch.stack(samples, dim=1)
+        else:
+            samples = outputs.prediction_outputs.unsqueeze(1)
 
-        # 从输出中提取预测结果
-        # outputs.prediction_outputs 的形状是 [bs, forecast_len, num_channels]
-        prediction = outputs.prediction_outputs
-        
-        # generate 函数期望的输出形状是 [bs, num_samples, forecast_len, num_channels]
-        # 因为我们是确定性预测，所以 num_samples = 1
-        samples = prediction.unsqueeze(1)
-
-        return SamplePatchTSTOutput(sequences=samples)
+        return SamplePatchTSTOutput(sequences=samples)  # type: ignore

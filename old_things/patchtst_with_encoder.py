@@ -24,7 +24,7 @@ from transformers.models.patchtst.modeling_patchtst import (
 )
 from transformers.utils import ModelOutput
 
-from ..panda.patchtst.modules import (
+from .modules import (
     DyT,
     PatchTSTKernelEmbedding,
     PatchTSTPatchify,

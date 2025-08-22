@@ -274,7 +274,7 @@ def evaluate_forecasting_model(
             # shape: (num_eval_windows * num_datasets, context_length, num_channels)
             contexts = np.concatenate(contexts, axis=0)
             
-            save_dir = './predictions/TimesFM/'
+            save_dir = False
             
             if save_dir:
                 # 确保保存目录存在

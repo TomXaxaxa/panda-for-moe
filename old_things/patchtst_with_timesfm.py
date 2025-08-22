@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
-import math
 import torch
 import torch.nn as nn
 from mamba_ssm import Mamba2
@@ -33,170 +32,7 @@ from .modules import (
     apply_p_rope_to_qk,
 )
 
-# ==========================================================================================
-# ================================ 新增 Koopa 核心模块 =======================================
-# ==========================================================================================
-
-# 模块1: 动态傅里叶滤波器
-class FourierFilter(nn.Module):
-    """
-    根据您的要求 [将模型分解为低频部分和高频部分]，实现动态傅里叶滤波器。
-    它会根据 [能量占比的方式选取低频谱] [要求 1]，对每个批次的数据进行实时划分。
-    """
-    def __init__(self, energy_percent=0.8):
-        super(FourierFilter, self).__init__()
-        if not (0 < energy_percent < 1):
-            raise ValueError("energy_percent must be between 0 and 1.")
-        self.energy_percent = energy_percent
-
-    def forward(self, x):
-        # x shape: [Batch, Sequence Length, Channels]
-        # 傅里叶变换和能量计算
-        xf = torch.fft.rfft(x, dim=1)
-        energies = torch.abs(xf) ** 2
-
-        # 排序能量并计算累积能量，以确定低频分量的索引
-        sorted_energies, sorted_indices = torch.sort(energies, dim=1, descending=True)
-        total_energy_per_series = torch.sum(energies, dim=1, keepdim=True)
-        cumulative_energies = torch.cumsum(sorted_energies, dim=1)
-        
-        # 找到达到能量阈值的频率数量 k
-        k = (cumulative_energies > total_energy_per_series * self.energy_percent).float().argmax(dim=1) + 1
-
-        # 创建动态掩码，Koopa论文的逻辑是掩盖掉低频部分来得到高频部分
-        num_frequencies = sorted_indices.shape[1]
-        # arange_f: [1, F, 1]
-        arange_f = torch.arange(num_frequencies, device=x.device).view(1, -1, 1)
-
-        # rank_tensor: [B, F, C] 表示每个频率的能量排名
-        rank_tensor = torch.empty_like(sorted_indices)
-        rank_tensor.scatter_(1, sorted_indices, arange_f.expand_as(sorted_indices))
-
-        # is_low_freq: [B, F, C] 布尔张量，能量排在k之前的为True
-        # k.unsqueeze(1): [B, 1, C]
-        is_low_freq = rank_tensor < k.unsqueeze(1)
-
-        # 创建掩码，将低频部分置为0
-        mask = torch.ones_like(xf, device=x.device)
-        mask[is_low_freq] = 0
-        
-        # 应用掩码分离高低频
-        # x_var 是高频部分 (time-variant)
-        x_var = torch.fft.irfft(xf * mask, n=x.shape[1], dim=1)
-        # x_inv 是低频部分 (time-invariant)，通过从原始信号中减去高频部分得到
-        x_inv = x - x_var
-        
-        return x_var, x_inv
-
-# 模块2: MLP (多层感知机)
-class MLP(nn.Module):
-    """
-    通用MLP模块，用于 [高频部分的Koopman网络实现] [要求 2] 中的编码器和解码器。
-    """
-    def __init__(self, f_in, f_out, hidden_dim=128, hidden_layers=2, dropout=0.05, activation='tanh'):
-        super(MLP, self).__init__()
-        self.activation = nn.Tanh() if activation == 'tanh' else nn.ReLU()
-        layers = [nn.Linear(f_in, hidden_dim), self.activation, nn.Dropout(dropout)]
-        for _ in range(hidden_layers - 2):
-            layers += [nn.Linear(hidden_dim, hidden_dim), self.activation, nn.Dropout(dropout)]
-        layers += [nn.Linear(hidden_dim, f_out)]
-        self.layers = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.layers(x)
-
-# 模块3: Koopman预测层 (KPLayer)
-class KPLayer(nn.Module):
-    """
-    Koopman预测层，使用Moore-Penrose伪逆计算Koopman矩阵，
-    并实现了您要求的 [有界性约束] [要求 3]。
-    """
-    def __init__(self):
-        super(KPLayer, self).__init__()
-        self.K = None
-
-    def forward(self, z, pred_len=1):
-        B, input_len, E = z.shape
-        x, y = z[:, :-1], z[:, 1:]
-        
-        # --- 临时注释掉瓶颈代码 ---
-        # self.K = torch.linalg.lstsq(x, y).solution
-        # with torch.no_grad():
-        #     eigenvalues = torch.linalg.eigvals(self.K)
-        #     max_abs_eig = torch.abs(eigenvalues).max(dim=-1).values
-        #     scaling_factor = torch.clamp(max_abs_eig, min=1.0).unsqueeze(-1).unsqueeze(-1)
-        # self.K = self.K / scaling_factor
-
-        # --- 用一个简单的随机矩阵代替K ---
-        self.K = torch.randn(B, E, E, device=z.device)
-
-        # 使用约束后的 K 进行预测
-        z_pred = torch.bmm(z[:, -1:], self.K)
-        z_preds = [z_pred]
-        for _ in range(1, pred_len):
-            z_pred = torch.bmm(z_pred, self.K)
-            z_preds.append(z_pred)
-        
-        return torch.cat(z_preds, dim=1)
-
-# 模块4: 时间可变 Koopman 预测器 (TimeVarKP) - 修正版
-class TimeVarKP(nn.Module):
-    """
-    实现了您要求的 [高频部分的Koopman网络实现] [要求 2]，
-    参考 "Koopa" 的 Time-Variant KP 实现。
-    此版本已修正，不再依赖外部 enc_in 参数，而是根据输入动态适应。
-    """
-    def __init__(self, input_len, pred_len, seg_len, dynamic_dim, encoder, decoder):
-        super(TimeVarKP, self).__init__()
-        self.input_len = input_len
-        self.pred_len = pred_len
-        self.seg_len = seg_len
-        # self.enc_in 不再需要
-        self.encoder, self.decoder = encoder, decoder
-        self.freq = math.ceil(self.input_len / self.seg_len)
-        self.step = math.ceil(self.pred_len / self.seg_len)
-        self.padding_len = self.seg_len * self.freq - self.input_len
-        self.dynamics = KPLayer()
-
-    def forward(self, x):
-        # x 原始形状: [B, L, C]
-        B, L, C = x.shape
-
-        # --- 修改开始：实现通道独立的计算 ---
-        # 1. 将多通道数据转换为批次内的单通道数据
-        # [B, L, C] -> [B, C, L] -> [B*C, L, 1]
-        x = x.transpose(1, 2).reshape(B * C, L, 1)
-
-        # 2. 对 [B*C, L, 1] 的数据进行 Koopman 预测
-        # 此处 C_internal 始终为 1
-        B_internal, L_internal, C_internal = x.shape
-
-        # padding, chunking 等操作现在都在 [B*C, L, 1] 的形状上进行
-        current_padding_len = self.seg_len * math.ceil(L_internal / self.seg_len) - L_internal
-        res = torch.cat((x[:, L_internal-current_padding_len:, :], x), dim=1)
-
-        current_freq = math.ceil(res.shape[1] / self.seg_len)
-        res = res.chunk(current_freq, dim=1)
-        # 特征维度现在是 seg_len * 1
-        res = torch.stack(res, dim=1).reshape(B_internal, current_freq, -1)
-
-        res_encoded = self.encoder(res)
-        x_pred_encoded = self.dynamics(res_encoded, self.step)
-
-        x_pred = self.decoder(x_pred_encoded)
-
-        # 3. 将预测结果的形状恢复
-        # x_pred 形状: [B*C, step, seg_len*1] -> [B*C, pred_len_padded, 1]
-        x_pred = x_pred.reshape(B_internal, self.step, self.seg_len, C_internal)
-        x_pred = x_pred.reshape(B_internal, -1, C_internal)[:, :self.pred_len, :]
-
-        # [B*C, pred_len, 1] -> [B, C, pred_len] -> [B, pred_len, C]
-        x_pred = x_pred.reshape(B, C, self.pred_len).transpose(1, 2)
-        # --- 修改结束 ---
-
-        return x_pred
-
-# ================================ 新增模块结束 =========================================
+OUTPUT_PATCH_LEN = 128
 
 @dataclass
 class CompletionsPatchTSTOutput(ModelOutput):
@@ -261,7 +97,7 @@ class PatchTSTRopeAttention(nn.Module):
             )
         self.scaling = self.head_dim**-0.5
         self.is_decoder = is_decoder
-        self.is_causal = is_causal
+        self.is_causal = is_causal # Note: this is from original code but not used, we will add `use_causal_mask` in forward.
 
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
@@ -287,6 +123,7 @@ class PatchTSTRopeAttention(nn.Module):
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
         linear_attn: bool = False,
+        use_causal_mask: bool = True, # ADDED: Causal mask flag
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
@@ -362,11 +199,29 @@ class PatchTSTRopeAttention(nn.Module):
                 f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
                 f" {attn_weights.size()}"
             )
+            
+        # MODIFIED: Logic to create and apply causal mask
+        if use_causal_mask:
+            if src_len != tgt_len:
+                 raise ValueError(
+                    f"Causal mask requires query and key sequence lengths to be equal, but got {tgt_len} and {src_len}"
+                )
+            # The mask is broadcastable to (bsz, num_heads, tgt_len, src_len)
+            causal_mask = torch.full((tgt_len, src_len), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+            causal_mask = torch.triu(causal_mask, diagonal=1)
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0) # Shape: [1, 1, tgt_len, src_len]
+            
+            # Combine with existing attention mask if any
+            if attention_mask is not None:
+                # attention_mask is expected to be of shape (bsz, 1, tgt_len, src_len)
+                attention_mask = attention_mask + causal_mask
+            else:
+                attention_mask = causal_mask
 
         if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+            if attention_mask.size() != (bsz, 1, tgt_len, src_len) and attention_mask.size() != (1, 1, tgt_len, src_len):
                 raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
+                    f"Attention mask should be of size compatible with (bsz, 1, tgt_len, src_len), but is {attention_mask.size()}"
                 )
             attn_weights = attn_weights.view(
                 bsz, self.num_heads, tgt_len, src_len
@@ -443,13 +298,6 @@ class PatchTSTEncoderLayerWithRope(nn.Module):
             max_wavelength=config.max_wavelength,
             rope_percent=config.rope_percent,
         )
-        # self.temporal_mamba = Mamba2(
-        #     d_model=config.d_model,
-        #     d_state=1024,
-        #     d_conv=4,
-        #     expand=2,
-        #     headdim=64
-        # )
         if self.channel_attention:
             self.channel_self_attn = PatchTSTRopeAttention(
                 embed_dim=config.d_model,
@@ -524,6 +372,7 @@ class PatchTSTEncoderLayerWithRope(nn.Module):
         output_attentions: Optional[bool] = None,
         channel_attention_mask: Optional[torch.Tensor] = None,
         linear_attn: bool = False,
+        use_causal_mask: bool = False, # MODIFIED: Propagate the flag
     ):
         """
         Parameters:
@@ -548,33 +397,30 @@ class PatchTSTEncoderLayerWithRope(nn.Module):
             attn_output, attn_weights, _ = self.temporal_self_attn(
                 hidden_states=self.norm_sublayer1(hidden_state),
                 output_attentions=output_attentions,
+                use_causal_mask=use_causal_mask, # MODIFIED: Pass the flag
             )
             # Add: residual connection with residual dropout
             hidden_state = hidden_state + self.dropout_path1(attn_output)
-            # mamba_input = self.norm_sublayer1(hidden_state)
-            # mamba_output = self.temporal_mamba(mamba_input)
-            # hidden_state = hidden_state + self.dropout_path1(mamba_output)
         else:
             ## Multi-Head attention and Add residual connection and Norm - Standard Transformer from BERT
             attn_output, attn_weights, _ = self.temporal_self_attn(
                 hidden_states=hidden_state,
                 output_attentions=output_attentions,
                 linear_attn=linear_attn,
+                use_causal_mask=use_causal_mask, # MODIFIED: Pass the flag
             )
             # hidden_states: [(bs*num_channels) x sequence_length x d_model]
             hidden_state = self.norm_sublayer1(
                 hidden_state + self.dropout_path1(attn_output)
             )
-            # mamba_output = self.temporal_mamba(hidden_state)
-            # hidden_state = self.norm_sublayer1(hidden_state + self.dropout_path1(mamba_output))
-            
-        # attn_weights = None
 
         # hidden_state: [bs x num_channels x sequence_length x d_model]
         hidden_state = hidden_state.reshape(
             batch_size, num_input_channels, sequence_length, d_model
         )
-
+        
+        channel_attn_weights = None # ADDED: Initialize channel_attn_weights
+        
         # second sublayer: attention across variable at any given time
         if self.channel_attention:
             # hidden_state: [bs x sequence_length x num_channels x d_model]
@@ -656,7 +502,6 @@ class PatchTSTEncoder(PatchTSTPreTrainedModel):
         super().__init__(config)
         self.gradient_checkpointing = False
         if config.use_dynamics_embedding:
-            # self.embedder = PatchTSTPolynomialEmbedding(config)
             self.embedder = PatchTSTKernelEmbedding(config)
         else:
             self.embedder = PatchTSTEmbedding(config)
@@ -678,6 +523,7 @@ class PatchTSTEncoder(PatchTSTPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         linear_attn: bool = False,
+        use_causal_mask: bool = False, # MODIFIED: Propagate the flag
     ) -> BaseModelOutput:
         """
         Parameters:
@@ -716,9 +562,9 @@ class PatchTSTEncoder(PatchTSTPreTrainedModel):
                 output_attentions=output_attentions,
                 channel_attention_mask=channel_attention_mask,
                 linear_attn=linear_attn,
+                use_causal_mask=use_causal_mask, # MODIFIED: Pass the flag
             )
             # get hidden state. hidden_state shape is [bs x num_channels x num_patches x d_model]
-            # or [bs x num_channels x (num_patches+1) x d_model] if use cls_token
             hidden_state = layer_outputs[0]
             # append attention matrix at each layer
             if output_attentions:
@@ -729,7 +575,6 @@ class PatchTSTEncoder(PatchTSTPreTrainedModel):
             hidden_states=encoder_states,  # type: ignore
             attentions=all_attentions,
         )
-
 
 class PatchTSTModel(PatchTSTPreTrainedModel):
     def __init__(self, config: PatchTSTConfig):
@@ -758,31 +603,9 @@ class PatchTSTModel(PatchTSTPreTrainedModel):
         output_attentions: Optional[bool] = None,
         channel_attention_mask: Optional[torch.Tensor] = None,
         linear_attn: bool = False,
+        use_causal_mask: bool = False, # MODIFIED: Propagate the flag
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, PatchTSTModelOutput]:
-        r"""
-        Parameters:
-            past_values (`torch.Tensor` of shape `(bs, sequence_length, num_input_channels)`, *required*):
-                Input sequence to the model
-            past_observed_mask (`torch.BoolTensor` of shape `(batch_size, sequence_length, num_input_channels)`, *optional*):
-                Boolean mask to indicate which `past_values` were observed and which were missing. Mask values selected
-                in `[0, 1]`:
-
-                - 1 for values that are **observed**,
-                - 0 for values that are **missing** (i.e. NaNs that were replaced by zeros).
-            future_values (`torch.BoolTensor` of shape `(batch_size, prediction_length, num_input_channels)`, *optional*):
-                Future target values associated with the `past_values`
-            output_hidden_states (`bool`, *optional*):
-                Whether or not to return the hidden states of all layers
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the output attention of all layers
-            return_dict (`bool`, *optional*):
-                Whether or not to return a `ModelOutput` instead of a plain tuple.
-
-        Returns:
-            `PatchTSTModelOutput` or tuple of `torch.Tensor` (if `return_dict`=False or `config.return_dict`=False)
-
-        """
 
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
@@ -815,6 +638,7 @@ class PatchTSTModel(PatchTSTPreTrainedModel):
             output_attentions=output_attentions,
             channel_attention_mask=channel_attention_mask,
             linear_attn=linear_attn,
+            use_causal_mask=use_causal_mask, # MODIFIED: Pass the flag
         )
 
         if not return_dict:
@@ -1020,21 +844,16 @@ class PatchTSTPredictionHead(nn.Module):
     ):
         super().__init__()
 
-        self.use_cls_token = config.use_cls_token
-        self.pooling_type = config.pooling_type
-        if self.pooling_type or self.use_cls_token:  # this should always be true
-            head_dim = config.d_model
-        else:  # included for completeness
-            # num_patches is set to a dummy value,
-            head_dim = config.d_model * num_patches
+        # TimesFM 思想：只使用最后一个 patch 的 embedding 来做预测
+        head_dim = config.d_model
 
         # all the channels share the same head
         self.flatten = nn.Flatten(start_dim=2)
         if distribution_output is None:
-            # use linear head with custom weight initialization
-            self.projection = nn.Linear(head_dim, config.prediction_length, bias=False)
+            # 关键修改：输出维度变为我们设定的 OUTPUT_PATCH_LEN
+            self.projection = nn.Linear(head_dim, OUTPUT_PATCH_LEN, bias=False)
         else:
-            # use distribution head
+            # (这部分逻辑保持不变，但实践中 TimesFM 论文主要使用 MSE)
             self.projection = distribution_output.get_parameter_projection(head_dim)
         self.dropout = (
             nn.Dropout(config.head_dropout)
@@ -1044,168 +863,196 @@ class PatchTSTPredictionHead(nn.Module):
 
     def forward(self, embedding: torch.Tensor):
         """
-        Parameters:
-            embedding (`torch.Tensor` of shape `(bs, num_channels, num_patches, d_model)` or
-                     `(bs, num_channels, num_patches+1, d_model)` if `cls_token` is set to True, *required*):
-                Embedding from the model
-        Returns:
+        参数:
+            embedding (`torch.Tensor` of shape `(bs, num_channels, num_patches, d_model)`):
+                来自模型编码器的 Embedding。
+        返回:
             `torch.Tensor` of shape `(bs, forecast_len, num_channels)`
-
         """
-        if self.use_cls_token:
-            # pooled_embedding: [bs x num_channels x d_model]
-            pooled_embedding = embedding[:, :, 0, :]
-        else:
-            if self.pooling_type == "mean":
-                # pooled_embedding: [bs x num_channels x d_model]
-                pooled_embedding = embedding.mean(dim=2)
-            elif self.pooling_type == "max":
-                # pooled_embedding: [bs x num_channels x d_model]
-                pooled_embedding = embedding.max(dim=2).values
-            else:
-                # pooled_embedding: [bs x num_channels x num_patches x d_model]
-                pooled_embedding = embedding
+        # TimesFM 推理逻辑: 不池化，直接取最后一个 patch 的 embedding
+        # embedding shape: [bs x num_channels x num_patches x d_model]
+        # last_patch_embedding shape: [bs x num_channels x 1 x d_model]
+        last_patch_embedding = embedding[:, :, -1:, :]
 
-        # pooled_embedding: [bs x num_channels x (d_model * num_patches)] or [bs x num_channels x d_model)]
-        pooled_embedding = self.flatten(pooled_embedding)
+        # [bs x num_channels x d_model]
+        pooled_embedding = self.flatten(last_patch_embedding)
         pooled_embedding = self.dropout(pooled_embedding)
 
-        # output: [bs x num_channels x forecast_len] or
-        # tuple ([bs x num_channels x forecast_len], [bs x num_channels x forecast_len]) if using distribution head
+        # output: [bs x num_channels x OUTPUT_PATCH_LEN]
         output = self.projection(pooled_embedding)
 
         if isinstance(output, tuple):
-            # output: ([bs x forecast_len x num_channels], [bs x forecast_len x num_channels])
             output = tuple(z.transpose(2, 1) for z in output)
         else:
-            output = output.transpose(2, 1)  # [bs x forecast_len x num_channels]
+            # [bs x OUTPUT_PATCH_LEN x num_channels]
+            output = output.transpose(2, 1)
         return output
 
 
 class PatchTSTForPrediction(PatchTSTPreTrainedModel):
     def __init__(self, config: PatchTSTConfig):
         super().__init__(config)
-
-        # --- 1. 硬编码新增的超参数 [要求 4] ---
-        # 您可以在这里修改这些值进行实验
-        config.energy_percent = 0.8  # 能量占比阈值
-        config.dynamic_dim = 128     # Koopman嵌入维度
-        config.seg_len = 24          # Koopman分段长度
-        config.hidden_dim = 128      # MLP隐藏层维度
-        config.hidden_layers = 2     # MLP隐藏层数量
         
-        # --- 2. 实例化混合模型所需的所有组件 ---
+        config.do_mask_input = False
+        self.model = PatchTSTModel(config)
         
-        # 实例化动态傅里叶滤波器 [要求 1]
-        self.fourier_filter = FourierFilter(energy_percent=config.energy_percent)
-        
-        # 实例化高频路径的Koopman模块 [要求 2]
-        # 现在，编码器和解码器只处理单通道数据 (通道维度为1)
-        # f_in 和 f_out 不再乘以 config.num_input_channels
-        koopman_encoder = MLP(
-            f_in=config.seg_len * 1,
-            f_out=config.dynamic_dim, activation='tanh',
-            hidden_dim=config.hidden_dim, hidden_layers=config.hidden_layers)
-        koopman_decoder = MLP(
-            f_in=config.dynamic_dim, 
-            f_out=config.seg_len * 1,
-            activation='tanh',
-            hidden_dim=config.hidden_dim, hidden_layers=config.hidden_layers)
-        self.time_var_kp = TimeVarKP(
-            input_len=config.context_length,
-            pred_len=config.prediction_length, 
-            seg_len=config.seg_len,
-            dynamic_dim=config.dynamic_dim, 
-            encoder=koopman_encoder,
-            decoder=koopman_decoder
-        )
-                                     
-        # 实例化低频路径的PatchTST模型
-        self.patchtst_model = PatchTSTModel(config)
-        # 为低频路径创建一个简单的线性预测头
-        self.low_freq_prediction_head = nn.Linear(config.d_model, config.prediction_length)
-
-        # 定义损失函数
-        if config.loss == "mse":
-            self.loss = nn.MSELoss(reduction="mean")
+        if config.loss == "mse" or config.loss == "huber":
+            self.distribution_output = None
         else:
-            raise ValueError(f"Only MSE loss is supported for this hybrid model.")
+            if config.distribution_output == "student_t":
+                self.distribution_output = StudentTOutput(dim=config.prediction_length)
+            elif config.distribution_output == "normal":
+                self.distribution_output = NormalOutput(dim=config.prediction_length)
+            elif config.distribution_output == "negative_binomial":
+                self.distribution_output = NegativeBinomialOutput(
+                    dim=config.prediction_length
+                )
+            else:
+                raise ValueError(
+                    f"Unknown distribution output {config.distribution_output}"
+                )
+
+        # 使用我们修改后的 Head
+        self.head = PatchTSTPredictionHead(
+            config, distribution_output=self.distribution_output
+        )
+
+        if config.loss == "mse":
+            self.loss = nn.MSELoss(reduction="none")
+        elif config.loss == "huber":
+            self.loss = nn.HuberLoss(reduction="none", delta=config.huber_delta)
+        else:
+            self.loss = None
             
         self.post_init()
 
     def forward(
         self,
         past_values: torch.Tensor,
-        future_values: Optional[torch.Tensor] = None,
-        # 其他参数可以保留，但在此实现中未使用
-        **kwargs
+        future_values: Optional[torch.Tensor] = None, # Trainer会传入这个
+        past_observed_mask: Optional[torch.Tensor] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        channel_attention_mask: Optional[torch.Tensor] = None,
+        return_dict: Optional[bool] = None,
+        linear_attn: bool = False,
+        use_causal_mask: bool = True,
+        schedule_param: float = 0.0,  # 修正1：增加这个参数以接收CustomTrainer的输入
     ) -> Union[Tuple, PatchTSTForPredictionOutput]:
 
-        # --- 3. 实现双路并行预测的 forward 逻辑 ---
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
-        # 步骤 A: 数据标准化
-        loc = past_values.mean(dim=1, keepdim=True)
-        scale = torch.sqrt(torch.var(past_values, dim=1, keepdim=True, unbiased=False) + 1e-5)
-        scaled_past_values = (past_values - loc) / scale
+        model_output = self.model(
+            past_values=past_values,
+            past_observed_mask=past_observed_mask,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            channel_attention_mask=channel_attention_mask,
+            return_dict=True,
+            linear_attn=linear_attn,
+            use_causal_mask=use_causal_mask,
+        )
         
-        # 步骤 B: 傅里叶动态解耦 [要求 1]
-        # x_var 是高频, x_inv 是低频
-        x_var, x_inv = self.fourier_filter(scaled_past_values)
-        
-        # 步骤 C: 低频路径 (由原PatchTST处理) [要求 1]
-        # 内部处理 patch 化和 embedding
-        patched_x_inv = self.patchtst_model.patchifier(x_inv)
-        encoder_output = self.patchtst_model.encoder(patch_input=patched_x_inv)
-        low_freq_embedding = encoder_output.last_hidden_state
-        # 使用 mean pooling 和线性头进行预测
-        low_freq_pooled = low_freq_embedding.mean(dim=2)
-        low_freq_pred_scaled = self.low_freq_prediction_head(low_freq_pooled).transpose(2, 1)
-        
-        # 步骤 D: 高频路径 (由Koopman网络处理) [要求 2]
-        high_freq_pred_scaled = self.time_var_kp(x_var)
-        
-        # 步骤 E: 融合预测结果并逆标准化
-        y_hat_scaled = low_freq_pred_scaled + high_freq_pred_scaled
-        y_hat = y_hat_scaled * scale + loc
+        all_predictions_by_step = self.head.projection(model_output.last_hidden_state)
 
-        # 步骤 F: 计算损失
         loss_val = None
         if future_values is not None:
-            loss_val = self.loss(y_hat, future_values)
-        
+            patch_len = self.config.patch_length
+            num_patches = model_output.last_hidden_state.shape[2]
+            
+            # 修正2：正确拼接past_values和future_values来构建完整序列
+            # past_values: [bs, context_len, num_channels]
+            # future_values: [bs, prediction_len, num_channels]
+            all_values_cat = torch.cat([past_values, future_values], dim=1)
+            
+            # 转置以便切片: [bs, num_channels, total_length]
+            all_values = all_values_cat.transpose(1, 2)
+            
+            targets = []
+            for i in range(num_patches - 1):
+                start_idx = (i + 1) * patch_len
+                end_idx = start_idx + OUTPUT_PATCH_LEN
+                if end_idx > all_values.shape[2]:
+                    break
+                target_slice = all_values[:, :, start_idx:end_idx]
+                targets.append(target_slice.unsqueeze(2))
+
+            if targets:
+                y_true = torch.cat(targets, dim=2)
+                num_valid_targets = y_true.shape[2]
+                y_hat_for_loss = all_predictions_by_step[:, :, :num_valid_targets, :]
+
+                loss = self.loss(y_hat_for_loss, y_true)
+                loss_val = loss.mean()
+            else:
+                loss_val = torch.tensor(0.0, device=past_values.device)
+
+        y_hat_last_step = all_predictions_by_step[:, :, -1, :].transpose(1, 2)
+        y_hat_out = y_hat_last_step * model_output.scale + model_output.loc
+
+        if not return_dict:
+            # ... (omitted for brevity) ...
+            pass
+            
         return PatchTSTForPredictionOutput(
             loss=loss_val,
-            prediction_outputs=y_hat
+            prediction_outputs=y_hat_out,
+            hidden_states=model_output.hidden_states,
+            attentions=model_output.attentions,
+            loc=model_output.loc,
+            scale=model_output.scale,
         )
 
     def generate(
         self,
         past_values: torch.Tensor,
-        past_observed_mask: Optional[torch.Tensor] = None, # 注意：此参数在新模型中未使用，但保留以兼容接口
-        channel_attention_mask: Optional[torch.Tensor] = None # 注意：此参数在新模型中未使用，但保留以兼容接口
+        past_observed_mask: Optional[torch.Tensor] = None,
     ) -> SamplePatchTSTOutput:
         """
-        为我们新的 Koopa-Transformer 混合模型生成确定性预测序列。
-        此版本已根据修改后的 forward 方法进行了简化。
+        Generates sequences auto-regressively based on the TimesFM methodology.
+        A single forward pass predicts a long patch of `OUTPUT_PATCH_LEN`.
         """
-        # 将模型设置为评估模式
-        self.eval()
+        output_patch_len = OUTPUT_PATCH_LEN
+        prediction_length = self.config.prediction_length
         
-        # 在 no_grad 上下文中执行，因为我们只是在进行推理，不需要计算梯度
-        with torch.no_grad():
-            # 调用我们重写过的 forward 方法进行预测
-            # future_values 设为 None，因为这是推理阶段
-            outputs = self.forward(
-                past_values=past_values,
-                future_values=None,
+        if prediction_length % output_patch_len != 0:
+            raise ValueError(
+                f"Prediction length ({prediction_length}) must be a multiple of "
+                f"the hardcoded output patch length ({output_patch_len}) for auto-regressive generation."
             )
 
-        # 从输出中提取预测结果
-        # outputs.prediction_outputs 的形状是 [bs, forecast_len, num_channels]
-        prediction = outputs.prediction_outputs
+        num_pred_loops = prediction_length // output_patch_len
         
-        # generate 函数期望的输出形状是 [bs, num_samples, forecast_len, num_channels]
-        # 因为我们是确定性预测，所以 num_samples = 1
-        samples = prediction.unsqueeze(1)
+        context = past_values
+        if past_observed_mask is None:
+            observed_mask_context = torch.ones_like(context)
+        else:
+            observed_mask_context = past_observed_mask
 
-        return SamplePatchTSTOutput(sequences=samples)
+        generated_sequence = []
+
+        for _ in range(num_pred_loops):
+            outputs = self.forward(
+                past_values=context,
+                past_observed_mask=observed_mask_context,
+                return_dict=True,
+                use_causal_mask=False 
+            )
+            
+            next_chunk = outputs.prediction_outputs
+            generated_sequence.append(next_chunk)
+
+            context = torch.cat([context[:, output_patch_len:, :], next_chunk], dim=1)
+            observed_mask_context = torch.cat(
+                [
+                    observed_mask_context[:, output_patch_len:, :],
+                    torch.ones_like(next_chunk)
+                ],
+                dim=1
+            )
+
+        final_prediction = torch.cat(generated_sequence, dim=1)
+        
+        return SamplePatchTSTOutput(sequences=final_prediction.unsqueeze(1))

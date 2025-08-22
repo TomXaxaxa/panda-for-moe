@@ -24,6 +24,8 @@ from panda.utils import (
 import torch.distributed as dist
 from panda.utils import is_main_process
 from panda.patchtst.deepseek_moe import MoEGate, DeepseekMLP
+# from panda.patchtst.patchtst import MoELayer
+import torch.nn as nn
 
 from collections import defaultdict
 
@@ -41,6 +43,60 @@ def get_ffn_input_hook(layer_idx):
         # 我们将其从计算图中分离，并移动到CPU以节省显存
         ffn_inputs[layer_idx].append(input[0].detach().cpu())
     return hook
+
+# def calculate_and_print_activated_params(model: nn.Module):
+#     """
+#     计算并打印模型中单次前向传播（per-token）激活的参数量。
+#     """
+#     if not is_main_process():
+#         return
+# 
+#     # 找到模型中所有的MoELayer实例
+#     moe_layers = [m for m in model.modules() if isinstance(m, MoELayer)]
+#     
+#     if not moe_layers:
+#         print("\n模型中未找到MoELayer，无法计算激活参数。")
+#         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+#         print(f"模型总参数量: {total_params / 1e6:.2f}M")
+#         return
+# 
+#     # 1. 计算模型总参数量
+#     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+# 
+#     # 2. 计算所有专家参数的总量
+#     total_expert_params = 0
+#     params_per_expert_layer = []
+#     for moe_layer in moe_layers:
+#         # 假设所有专家的结构都相同，计算单个专家的参数量
+#         params_one_expert = sum(p.numel() for p in moe_layer.experts[0].parameters() if p.requires_grad)
+#         params_per_expert_layer.append(params_one_expert)
+#         # 累加该层所有专家的总参数
+#         total_expert_params += params_one_expert * len(moe_layer.experts)
+#         
+#     # 3. 计算共享参数量
+#     shared_params = total_params - total_expert_params
+# 
+#     # 4. 计算激活的专家参数量
+#     # 假设每个MoE层都使用相同的top_k值
+#     top_k = moe_layers[0].gating_network.top_k 
+#     activated_expert_params = sum(params * top_k for params in params_per_expert_layer)
+# 
+#     # 5. 计算总激活参数量
+#     total_activated_params = shared_params + activated_expert_params
+#     
+#     # 打印报告
+#     print("\n" + "="*50)
+#     print(" " * 10 + "模型激活参数 (Per-Token) 报告")
+#     print("="*50)
+#     print(f"共享 (Base) 参数量:        {shared_params / 1e6:8.2f}M")
+#     print(f"每个MoE层激活专家数 (Top-K): {top_k}")
+#     print(f"单次预测激活的专家参数量: {activated_expert_params / 1e6:8.2f}M")
+#     print("-" * 50)
+#     print(f"总激活参数量:              {total_activated_params / 1e6:8.2f}M")
+#     print("-" * 50)
+#     print(f"模型总参数量 (含未激活专家): {total_params / 1e6:.2f}M")
+#     print(f"激活参数占比:               {total_activated_params / total_params:.2%}")
+#     print("="*50 + "\n")
 
 # def log_moe_stats(model: torch.nn.Module):
 #     """
@@ -125,6 +181,9 @@ def main(cfg):
         device_map=cfg.eval.device,
         torch_dtype=torch_dtype,
     )
+    
+    # calculate_and_print_activated_params(pipeline.model)
+    
     model_config = dict(vars(pipeline.model.config))
     train_config = train_config or dict(cfg.train)
     # set floating point precision

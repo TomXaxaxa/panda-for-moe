@@ -271,6 +271,7 @@ def main(cfg):
         dataloader_num_workers=dataloader_num_workers,
         dataloader_prefetch_factor=cfg.train.dataloader_prefetch_factor,
         tf32=use_tf32,  # remove this if not using Ampere GPUs (e.g., A100)
+#       bf16=True,      # using only when flash attention is enabled
         torch_compile=cfg.train.torch_compile,
         ddp_find_unused_parameters=cfg.train.ddp_find_unused_parameters,
         ddp_backend=cfg.train.ddp_backend,

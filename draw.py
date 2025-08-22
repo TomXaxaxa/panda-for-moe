@@ -211,7 +211,7 @@ if __name__ == '__main__':
     # analyze_and_plot(base_dir='eval_results/patchtst')
 
     # 示例2: 只分析和绘制指定的两个模型
-    models_to_run = ['panda256+encoder', 'panda256+16decoder', 'panda256+TimesFM']
+    models_to_run = ['panda256+encoder', 'panda256+encoder+FlashAttention']
     analyze_and_plot(base_dir='eval_results/patchtst', models_to_plot=models_to_run)
     
     # 示例3: 如果目录不存在，脚本将自动创建包含三个模型的虚拟数据并绘图
