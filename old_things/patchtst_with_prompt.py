@@ -3,7 +3,7 @@
 # ==================== 全局注意力实现控制 ====================
 # 在此处设置要使用的注意力实现。
 # 可选项: "flash_attention_2" 或 "eager" (PyTorch 标准实现)
-_ATTN_IMPLEMENTATION = "eager"
+_ATTN_IMPLEMENTATION = "flash_attention_2"
 
 # 检查 Flash Attention 2 是否可用
 try:
@@ -51,397 +51,37 @@ from .modules import (
     apply_p_rope_to_qk,
 )
 
-class Expert(nn.Module):
-    """一个简单的多层感知机（MLP）作为专家网络"""
-    def __init__(self, d_model: int, d_hidden: int, dropout: float = 0.1, activation_function: str = "gelu"):
+import torch.nn.functional as F
+
+class Memory(nn.Module):
+    """ Memory prompt, copied from UrbanDiT implementation """
+    def __init__(self, num_memory, memory_dim):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_model, d_hidden),
-            ACT2CLS[activation_function](),
-            nn.Dropout(dropout),
-            nn.Linear(d_hidden, d_model)
-        )
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        self.num_memory = num_memory
+        self.memory_dim = memory_dim
 
-class TokenClusterGating(nn.Module):
-    """基于预训练聚类中心的非训练门控网络"""
-    def __init__(self, d_model: int, num_experts: int, top_k: int, centroids: torch.Tensor):
-        super().__init__()
-        self.top_k = top_k
-        self.num_experts = num_experts
-        if centroids.shape != (num_experts, d_model):
-            raise ValueError(f"Centroids shape must be ({num_experts}, {d_model}), but got {centroids.shape}")
-        self.register_buffer("centroids", centroids)
+        self.memMatrix = nn.Parameter(torch.zeros(num_memory, memory_dim))  # M,C
+        self.keyMatrix = nn.Parameter(torch.zeros(num_memory, memory_dim))  # M,C
 
-        # ======================== 新增代码开始 ========================
-        # 注册缓冲区来存储统计信息
-        # 这确保了张量随模型移动（例如 .to(device)），但不会被视为模型参数
-        self.register_buffer("expert_usage_count", torch.zeros(num_experts, dtype=torch.long))
-        self.register_buffer("total_tokens_routed", torch.tensor(0, dtype=torch.long))
-        # ======================== 新增代码结束 ========================
+        # Initialize weights
+        torch.nn.init.trunc_normal_(self.memMatrix, std=0.02)
+        torch.nn.init.trunc_normal_(self.keyMatrix, std=0.02)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        flat_x = x.view(-1, x.size(-1))
-        distances = torch.cdist(flat_x, self.centroids)
-        affinity_scores = -distances
-        top_k_scores, top_k_indices = torch.topk(affinity_scores, self.top_k, dim=-1)
+        self.x_proj = nn.Linear(memory_dim, memory_dim)
 
-        # ======================== 新增代码开始 ========================
-        # 仅在评估模式下（.eval()）进行统计，以避免影响训练性能
-        if not self.training:
-            # top_k_indices 的形状是 [num_tokens, top_k]
-            # .flatten() 将其变为一个一维张量，包含了所有被选中的专家的索引
-            chosen_experts = top_k_indices.flatten()
-            
-            # 使用 bincount 高效地计算这个批次中每个专家被选中的次数
-            batch_counts = torch.bincount(chosen_experts, minlength=self.num_experts)
-            
-            # 就地更新总计数
-            self.expert_usage_count.add_(batch_counts)
-            self.total_tokens_routed.add_(flat_x.size(0))
-        # ======================== 新增代码结束 ========================
-
-        gating_output = torch.full_like(affinity_scores, float('-inf'))
-        gating_output.scatter_(-1, top_k_indices, top_k_scores)
-        gating_output = nn.functional.softmax(gating_output, dim=-1)
-        return gating_output.view(x.size(0), x.size(1), -1)
-
-    # ======================== 新增代码开始 ========================
-    def reset_stats(self):
-        """重置专家使用情况的统计数据。"""
-        self.expert_usage_count.zero_()
-        self.total_tokens_routed.zero_()
-    # ======================== 新增代码结束 ========================
-
-class MoELayer(nn.Module):
-    """集成了多个专家网络和基于聚类的门控网络的MoE层"""
-    def __init__(self, d_model: int, num_experts: int, expert_hidden_dim: int, top_k: int, centroids: torch.Tensor, dropout: float, activation: str):
-        super().__init__()
-        self.gating_network = TokenClusterGating(d_model, num_experts, top_k, centroids)
-        self.experts = nn.ModuleList([
-            Expert(d_model, expert_hidden_dim, dropout, activation) for _ in range(num_experts)
-        ])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        router_logits = self.gating_network(x)
-        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=2)
-        weighted_expert_outputs = expert_outputs * router_logits.unsqueeze(-1)
-        return torch.sum(weighted_expert_outputs, dim=2)
-
-class PatchTSTEncoderLayerWithMoE(nn.Module):
-    """
-    集成了MoE层的PatchTST编码器层。
-    这个类是 PatchTSTEncoderLayerWithRope 的修改版。
-    """
-    def __init__(self, config: PatchTSTConfig, layer_centroids: torch.Tensor):
-        super().__init__()
-
-        self.channel_attention = config.channel_attention
-        # Multi-Head attention
-        self.temporal_self_attn = PatchTSTRopeAttention(
-            embed_dim=config.d_model,
-            num_heads=config.num_attention_heads,
-            dropout=config.attention_dropout,
-            use_rope=True,
-            max_wavelength=config.max_wavelength,
-            rope_percent=config.rope_percent,
-        )
-        # self.temporal_mamba = Mamba2(
-        #     d_model=config.d_model,
-        #     d_state=1024,
-        #     d_conv=4,
-        #     expand=2,
-        #     headdim=64
-        # )
-        if self.channel_attention:
-            self.channel_self_attn = PatchTSTRopeAttention(
-                embed_dim=config.d_model,
-                num_heads=config.num_attention_heads,
-                dropout=config.attention_dropout,
-                use_rope=config.channel_rope,  # channels are not positional
-                max_wavelength=config.max_wavelength,
-                rope_percent=config.rope_percent,
-            )
-
-        # Add & Norm of the sublayer 1
-        self.dropout_path1 = (
-            nn.Dropout(config.path_dropout)
-            if config.path_dropout > 0
-            else nn.Identity()
-        )
-        if config.norm_type == "rmsnorm":
-            self.norm_sublayer1 = PatchTSTRMSNorm(config.d_model, config.norm_eps)
-        elif config.norm_type == "layernorm":
-            self.norm_sublayer1 = nn.LayerNorm(config.d_model, eps=config.norm_eps)
-        elif config.norm_type == "dyt":
-            self.norm_sublayer1 = DyT(config.d_model)
-        else:
-            raise ValueError(f"{config.norm_type} is not a supported norm layer type.")
-
-        # Add & Norm of the sublayer 2
-        if self.channel_attention:
-            self.dropout_path2 = (
-                nn.Dropout(config.path_dropout)
-                if config.path_dropout > 0
-                else nn.Identity()
-            )
-            if config.norm_type == "rmsnorm":
-                self.norm_sublayer2 = PatchTSTRMSNorm(config.d_model, config.norm_eps)
-            elif config.norm_type == "layernorm":
-                self.norm_sublayer2 = nn.LayerNorm(config.d_model, eps=config.norm_eps)
-            elif config.norm_type == "dyt":
-                self.norm_sublayer2 = DyT(config.d_model)
-            else:
-                raise ValueError(
-                    f"{config.norm_type} is not a supported norm layer type."
-                )
-
-        self.ff = MoELayer(
-            d_model=config.d_model,
-            num_experts=8,  # 根据您的计划硬编码为8
-            expert_hidden_dim=config.ffn_dim,
-            top_k=2,  # 默认激活2个专家，您可以按需修改
-            centroids=layer_centroids,
-            dropout=config.ff_dropout,
-            activation=config.activation_function
-        )
-
-        # Add & Norm of sublayer 3
-        self.dropout_path3 = (
-            nn.Dropout(config.path_dropout)
-            if config.path_dropout > 0
-            else nn.Identity()
-        )
-        if config.norm_type == "rmsnorm":
-            self.norm_sublayer3 = PatchTSTRMSNorm(config.d_model, config.norm_eps)
-        elif config.norm_type == "layernorm":
-            self.norm_sublayer3 = nn.LayerNorm(config.d_model, eps=config.norm_eps)
-        elif config.norm_type == "dyt":
-            self.norm_sublayer3 = DyT(config.d_model)
-        else:
-            raise ValueError(f"{config.norm_type} is not a supported norm layer type.")
-
-        self.pre_norm = config.pre_norm
-
-    def forward(
-        self,
-        hidden_state: torch.Tensor,
-        output_attentions: Optional[bool] = None,
-        channel_attention_mask: Optional[torch.Tensor] = None,
-        linear_attn: bool = False,
-    ):
+    def forward(self, x):
         """
-        Parameters:
-            hidden_state (`torch.Tensor` of shape `(batch_size, num_channels, sequence_length, d_model)`, *required*):
-                Past values of the time series
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the output attention of all layers
-        Return:
-            `torch.Tensor` of shape `(batch_size, num_channels, sequence_length, d_model)`
-
+        :param x: query features with size [N,C], where N is the number of query items,
+                  C is same as dimension of memory slot
+        :return: query output retrieved from memory, with the same size as x.
         """
-        batch_size, num_input_channels, sequence_length, d_model = hidden_state.shape
+        assert x.shape[-1] == self.memMatrix.shape[-1] == self.keyMatrix.shape[-1], "dimension mismatch"
 
-        # First sublayer: attention across time
-        # hidden_states: [(bs*num_channels) x sequence_length x d_model]
-        hidden_state = hidden_state.view(
-            batch_size * num_input_channels, sequence_length, d_model
-        )
-
-        if self.pre_norm:
-            ## Norm and Multi-Head attention and Add residual connection
-            attn_output, attn_weights, _ = self.temporal_self_attn(
-                hidden_states=self.norm_sublayer1(hidden_state),
-                output_attentions=output_attentions,
-            )
-            # Add: residual connection with residual dropout
-            hidden_state = hidden_state + self.dropout_path1(attn_output)
-            # mamba_input = self.norm_sublayer1(hidden_state)
-            # mamba_output = self.temporal_mamba(mamba_input)
-            # hidden_state = hidden_state + self.dropout_path1(mamba_output)
-        else:
-            ## Multi-Head attention and Add residual connection and Norm - Standard Transformer from BERT
-            attn_output, attn_weights, _ = self.temporal_self_attn(
-                hidden_states=hidden_state,
-                output_attentions=output_attentions,
-                linear_attn=linear_attn,
-            )
-            # hidden_states: [(bs*num_channels) x sequence_length x d_model]
-            hidden_state = self.norm_sublayer1(
-                hidden_state + self.dropout_path1(attn_output)
-            )
-            # mamba_output = self.temporal_mamba(hidden_state)
-            # hidden_state = self.norm_sublayer1(hidden_state + self.dropout_path1(mamba_output))
-            
-        # attn_weights = None
-
-        # hidden_state: [bs x num_channels x sequence_length x d_model]
-        hidden_state = hidden_state.reshape(
-            batch_size, num_input_channels, sequence_length, d_model
-        )
-
-        # second sublayer: attention across variable at any given time
-        if self.channel_attention:
-            # hidden_state: [bs x sequence_length x num_channels x d_model]
-            hidden_state = hidden_state.transpose(2, 1).contiguous()
-            # hidden_state: [(bs*sequence_length) x num_channels x d_model]
-            hidden_state = hidden_state.view(
-                batch_size * sequence_length, num_input_channels, d_model
-            )
-            if self.pre_norm:
-                ## Norm and Multi-Head attention and Add residual connection
-                attn_output, channel_attn_weights, _ = self.channel_self_attn(
-                    hidden_states=self.norm_sublayer2(hidden_state),
-                    output_attentions=output_attentions,
-                    attention_mask=channel_attention_mask,
-                )
-                # Add: residual connection with residual dropout
-                hidden_state = hidden_state + self.dropout_path2(attn_output)
-            else:
-                ## Multi-Head attention and Add residual connection and Norm
-                attn_output, channel_attn_weights, _ = self.channel_self_attn(
-                    hidden_states=hidden_state,
-                    output_attentions=output_attentions,
-                    attention_mask=channel_attention_mask,
-                    linear_attn=linear_attn,
-                )
-                # hidden_states: [(bs*sequence_length) x num_channels x d_model]
-                hidden_state = self.norm_sublayer2(
-                    hidden_state + self.dropout_path2(attn_output)
-                )
-
-            # Reshape hidden state
-            # hidden_state: [bs x sequence_length x num_channels x d_model]
-            hidden_state = hidden_state.reshape(
-                batch_size, sequence_length, num_input_channels, d_model
-            )
-            # hidden_state: [bs x num_channels x sequence_length x d_model]
-            hidden_state = hidden_state.transpose(1, 2).contiguous()
-
-        # Third sublayer: mixing across hidden
-        # hidden_state: [(batch_size*num_channels) x sequence_length x d_model]
-        hidden_state = hidden_state.view(
-            batch_size * num_input_channels, sequence_length, d_model
-        )
-        if self.pre_norm:
-            ## Norm and Position-wise Feed-Forward and Add residual connection
-            # Add: residual connection with residual dropout
-            hidden_state = hidden_state + self.dropout_path3(
-                self.ff(self.norm_sublayer3(hidden_state))
-            )
-        else:
-            ## Position-wise Feed-Forward and Add residual connection and Norm
-            # Add: residual connection with residual dropout
-            hidden_state = self.norm_sublayer3(
-                hidden_state + self.dropout_path3(self.ff(hidden_state))
-            )
-
-        # [bs x num_channels x sequence_length x d_model]
-        hidden_state = hidden_state.reshape(
-            batch_size, num_input_channels, sequence_length, d_model
-        )
-
-        outputs = (hidden_state,)
-        if output_attentions:
-            outputs += (
-                (attn_weights, channel_attn_weights)
-                if self.channel_attention
-                else (attn_weights,)
-            )
-
-        return outputs
-    
-class PatchTSTEncoderWithMoE(PatchTSTPreTrainedModel):
-    """
-    使用MoE层的PatchTST编码器。
-    """
-    def __init__(self, config: PatchTSTConfig, centroids_path: str):
-        super().__init__(config)
-        self.gradient_checkpointing = False
-        
-        # 依旧使用原始的 embedder
-        if config.use_dynamics_embedding:
-            self.embedder = PatchTSTKernelEmbedding(config)
-        else:
-            self.embedder = PatchTSTEmbedding(config)
-
-        # --- 加载聚类中心并创建MoE层 ---
-        print(f"MoE模式：正在从 {centroids_path} 加载聚类中心...")
-        try:
-            all_centroids = torch.load(centroids_path, map_location='cpu')
-            print(f"成功加载 {len(all_centroids)} 层的聚类中心。")
-        except FileNotFoundError:
-            raise FileNotFoundError(f"聚类中心文件未找到: {centroids_path}。请先运行聚类脚本。")
-
-        self.layers = nn.ModuleList(
-            [
-                PatchTSTEncoderLayerWithMoE(config, all_centroids[i])
-                for i in range(config.num_hidden_layers)
-            ]
-        )
-        # -----------------------------
-        
-        self.post_init()
-
-    def forward(
-        self,
-        patch_input: torch.Tensor,
-        channel_attention_mask: Optional[torch.Tensor] = None,
-        output_hidden_states: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        linear_attn: bool = False,
-    ) -> BaseModelOutput:
-        """
-        Parameters:
-            patch_input (`torch.Tensor` of shape `(batch_size, num_channels, num_patches, patch_length)`, *required*):
-                Past values of the time series
-            output_hidden_states (bool, optional): Indicates if hidden states should be outputted.
-            output_attentions (bool, optional): Indicates if attentions should be outputted.
-
-        return:
-            `BaseModelOutput`
-        """
-        output_attentions = (
-            output_attentions
-            if output_attentions is not None
-            else self.config.output_attentions
-        )
-        output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else self.config.output_hidden_states
-        )
-
-        # Input embedding
-        patch_input = self.embedder(patch_input)
-        hidden_state = patch_input
-
-        encoder_states = () if output_hidden_states else None
-        all_attentions = () if output_attentions else None
-
-        for encoder_layer in self.layers:
-            if output_hidden_states:
-                encoder_states = encoder_states + (hidden_state,)  # type: ignore
-
-            layer_outputs = encoder_layer(
-                hidden_state=hidden_state,
-                output_attentions=output_attentions,
-                channel_attention_mask=channel_attention_mask,
-                linear_attn=linear_attn,
-            )
-            # get hidden state. hidden_state shape is [bs x num_channels x num_patches x d_model]
-            # or [bs x num_channels x (num_patches+1) x d_model] if use cls_token
-            hidden_state = layer_outputs[0]
-            # append attention matrix at each layer
-            if output_attentions:
-                all_attentions = all_attentions + layer_outputs[1:]  # type: ignore
-        # return past_values, hidden_states
-        return BaseModelOutput(
-            last_hidden_state=hidden_state,  # type: ignore
-            hidden_states=encoder_states,  # type: ignore
-            attentions=all_attentions,
-        )
+        x_query = torch.tanh(self.x_proj(x))
+        att_weight = F.linear(input=x_query, weight=self.keyMatrix)  # [N,C] by [M,C]^T --> [N,M]
+        att_weight = F.softmax(att_weight, dim=-1)  # NxM
+        out = F.linear(att_weight, self.memMatrix.permute(1, 0))  # [N,M] by [M,C]  --> [N,C]
+        return {'out': out, 'att_weight': att_weight}
 
 @dataclass
 class CompletionsPatchTSTOutput(ModelOutput):
@@ -473,8 +113,7 @@ class PatchTSTRopeAttention(nn.Module):
     """
     Multi-headed attention from 'Attention Is All You Need' paper
 
-    Implemented with p-rotary positional embeddings.
-    This version is modified to support Flash Attention 2 via a global switch.
+    Implemented with p-rotary positional embeddings
     """
 
     def __init__(
@@ -488,6 +127,7 @@ class PatchTSTRopeAttention(nn.Module):
         use_rope: bool = True,
         max_wavelength: int = 10000,
         rope_percent: float = 0.5,
+        config: Optional[PatchTSTConfig] = None,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -497,9 +137,12 @@ class PatchTSTRopeAttention(nn.Module):
         self.max_wavelength = max_wavelength
         self.rope_percent = rope_percent
         self.use_rope = use_rope
+        self.config = config
         
+        # === 新增代码开始 ===
         # 直接从全局变量读取注意力实现方式
         self.attn_implementation = _ATTN_IMPLEMENTATION
+        # === 新增代码结束 ===
 
         if (self.head_dim * num_heads) != self.embed_dim:
             raise ValueError(
@@ -529,12 +172,12 @@ class PatchTSTRopeAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         key_value_states: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
-        linear_attn: bool = False, # Note: linear_attn is not used in Flash Attention path
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        linear_attn: bool = False, # 注意: linear_attn 在 Flash Attention 路径中不被使用
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
         is_cross_attention = key_value_states is not None
@@ -542,11 +185,10 @@ class PatchTSTRopeAttention(nn.Module):
         # ======================== Flash Attention 2 快速路径 ========================
         # 仅在满足以下条件时使用 Flash Attention：
         # 1. 全局开关 _ATTN_IMPLEMENTATION 设置为 "flash_attention_2"
-        # 2. 已成功导入 flash_attn 库
+        # 2. 已成功导入 flash_attn 库 (由全局开关处理)
         # 3. 未请求输出注意力权重 (output_attentions=False)
         # 4. 是自注意力，而不是交叉注意力且无缓存
         if self.attn_implementation == "flash_attention_2" and not output_attentions and not is_cross_attention and past_key_value is None:
-            # print("Flash Attention 2 ACTIVATED!")
             bsz, tgt_len, _ = hidden_states.size()
             
             query_states = self.q_proj(hidden_states)
@@ -564,7 +206,6 @@ class PatchTSTRopeAttention(nn.Module):
                 q_for_rope = query_states.contiguous().view(-1, tgt_len, self.head_dim)
                 k_for_rope = key_states.contiguous().view(-1, tgt_len, self.head_dim)
                 
-                # 注意：您需要确保 apply_p_rope_to_qk 函数可用
                 k_for_rope, q_for_rope = apply_p_rope_to_qk(
                     k_for_rope,
                     q_for_rope,
@@ -575,14 +216,6 @@ class PatchTSTRopeAttention(nn.Module):
                 )
                 query_states = q_for_rope.view(bsz, tgt_len, self.num_heads, self.head_dim)
                 key_states = k_for_rope.view(bsz, tgt_len, self.num_heads, self.head_dim)
-
-            # ==================== 插入下面的调试代码 ====================
-            # print("\n--- DEBUG: Dtypes right before flash_attn_func ---")
-            # print(f"query_states dtype: {query_states.dtype}")
-            # print(f"key_states dtype:   {key_states.dtype}")
-            # print(f"value_states dtype: {value_states.dtype}")
-            # print("--------------------------------------------------\n")
-            # ==========================================================
 
             attn_output = flash_attn_func(
                 query_states,
@@ -601,9 +234,14 @@ class PatchTSTRopeAttention(nn.Module):
         # ======================== 原始 Eager Attention 逻辑 (回退路径) ========================
         bsz, tgt_len, _ = hidden_states.size()
 
+        # get query proj
         query_states = self.q_proj(hidden_states) * self.scaling
-        
-        if is_cross_attention and past_key_value is not None:
+        # get key, value proj
+        if (
+            is_cross_attention
+            and past_key_value is not None
+            and past_key_value[0].shape[2] == key_value_states.shape[1]
+        ):
             key_states = past_key_value[0]
             value_states = past_key_value[1]
         elif is_cross_attention:
@@ -630,36 +268,71 @@ class PatchTSTRopeAttention(nn.Module):
         if self.use_rope:
             position_ids = self.get_seq_pos(src_len, key_states.device, key_states.dtype)
             key_states, query_states = apply_p_rope_to_qk(
-                key_states, query_states, position_ids, self.head_dim, self.max_wavelength, self.rope_percent
+                key_states,
+                query_states,
+                position_ids,
+                self.head_dim,
+                self.max_wavelength,
+                self.rope_percent,
             )
 
         attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
-            raise ValueError(f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is {attn_weights.size()}")
+            raise ValueError(
+                f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
+                f" {attn_weights.size()}"
+            )
 
         if attention_mask is not None:
-            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask.to(attn_weights.device)
+            if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
+                )
+            attn_weights = attn_weights.view(
+                bsz, self.num_heads, tgt_len, src_len
+            ) + attention_mask.to(attn_weights.device)
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
         if not linear_attn:
             attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
         if layer_head_mask is not None:
-            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+            if layer_head_mask.size() != (self.num_heads,):
+                raise ValueError(
+                    f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
+                    f" {layer_head_mask.size()}"
+                )
+            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(
+                bsz, self.num_heads, tgt_len, src_len
+            )
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
         if output_attentions:
-            attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+            attn_weights_reshaped = attn_weights.view(
+                bsz, self.num_heads, tgt_len, src_len
+            )
+            attn_weights = attn_weights_reshaped.view(
+                bsz * self.num_heads, tgt_len, src_len
+            )
         else:
             attn_weights_reshaped = None
 
-        attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+        attn_probs = nn.functional.dropout(
+            attn_weights, p=self.dropout, training=self.training
+        )
+
         attn_output = torch.bmm(attn_probs, value_states)
 
-        attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim).transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, tgt_len, self.embed_dim)
+        if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz * self.num_heads, tgt_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
 
+        attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
+        attn_output = attn_output.transpose(1, 2)
+        attn_output = attn_output.reshape(bsz, tgt_len, self.embed_dim)
         attn_output = self.out_proj(attn_output)
 
         return attn_output, attn_weights_reshaped, past_key_value
@@ -914,6 +587,7 @@ class PatchTSTEncoder(PatchTSTPreTrainedModel):
     def forward(
         self,
         patch_input: torch.Tensor,
+        prompt_tokens: Optional[torch.Tensor] = None, # <--- 新增参数
         channel_attention_mask: Optional[torch.Tensor] = None,
         output_hidden_states: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -943,6 +617,14 @@ class PatchTSTEncoder(PatchTSTPreTrainedModel):
         # Input embedding
         patch_input = self.embedder(patch_input)
         hidden_state = patch_input
+        
+        # === 新增代码开始 ===
+        # Prepend prompt tokens to the sequence if they exist
+        if prompt_tokens is not None:
+            # hidden_state shape: (bs, num_channels, num_patches, d_model)
+            # prompt_tokens shape: (bs, num_channels, 1, d_model)
+            hidden_state = torch.cat((prompt_tokens, hidden_state), dim=2)
+        # === 新增代码结束 ===
 
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
@@ -972,7 +654,7 @@ class PatchTSTEncoder(PatchTSTPreTrainedModel):
 
 
 class PatchTSTModel(PatchTSTPreTrainedModel):
-    def __init__(self, config: PatchTSTConfig, centroids_path: Optional[str] = "./panda_moe_centroids.pt"): # <-- 1. 添加 centroids_path 参数
+    def __init__(self, config: PatchTSTConfig):
         super().__init__(config)
 
         self.scaler = PatchTSTScaler(config)
@@ -984,16 +666,17 @@ class PatchTSTModel(PatchTSTPreTrainedModel):
             self.masking = PatchTSTMasking(config)
         else:
             self.masking = nn.Identity()
+        self.encoder = PatchTSTEncoder(config)
+        
+        # === 新增代码开始 ===
+        # Hardcoded hyperparameters for the prompt network
+        num_memory = 512
+        # The length of the real part of FFT result for the time series
+        fft_input_dim = config.context_length // 2 + 1 
 
-        # ======================== 主要修改点 ========================
-        # 2. 根据是否提供 centroids_path 来决定使用哪个Encoder
-        if centroids_path:
-            # 使用新的MoE Encoder
-            self.encoder = PatchTSTEncoderWithMoE(config, centroids_path=centroids_path)
-        else:
-            # 使用原始的Encoder
-            self.encoder = PatchTSTEncoder(config)
-        # ==========================================================
+        self.fft_proj = nn.Linear(fft_input_dim, config.d_model)
+        self.freq_memory_prompt = Memory(num_memory=num_memory, memory_dim=config.d_model)
+        # === 新增代码结束 ===
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1051,6 +734,25 @@ class PatchTSTModel(PatchTSTPreTrainedModel):
             past_observed_mask = torch.ones_like(past_values)
 
         scaled_past_values, loc, scale = self.scaler(past_values, past_observed_mask)
+        
+        # === 新增代码开始 ===
+        # Generate prompt from FFT features
+        # past_values shape: (bs, sequence_length, num_input_channels)
+        bs, seq_len, n_channels = past_values.shape
+
+        # 1. Calculate FFT
+        # Transpose to (bs, num_input_channels, sequence_length) for batch FFT
+        fft_features = torch.fft.rfft(scaled_past_values.transpose(1, 2), dim=-1).real
+
+        # 2. Project FFT features to query dimension
+        fft_query = self.fft_proj(fft_features) # Shape: (bs, n_channels, d_model)
+
+        # 3. Retrieve prompt from memory
+        prompt_tokens = self.freq_memory_prompt(fft_query.reshape(-1, self.config.d_model))['out']
+        # Reshape to (bs, n_channels, 1, d_model) to act as a single prompt token per channel
+        prompt_tokens = prompt_tokens.reshape(bs, n_channels, 1, self.config.d_model)
+        # === 新增代码结束 ===
+        
         patched_values = self.patchifier(scaled_past_values)
 
         if self.do_mask_input:
@@ -1060,6 +762,7 @@ class PatchTSTModel(PatchTSTPreTrainedModel):
 
         encoder_output = self.encoder(
             patch_input=masked_values,
+            prompt_tokens=prompt_tokens,
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             channel_attention_mask=channel_attention_mask,
@@ -1261,14 +964,6 @@ class PatchTSTForPretraining(PatchTSTPreTrainedModel):
             scale=model_output.scale,
             mask=model_output.mask,
         )
-    
-    def reset_moe_stats(self):
-        """
-        遍历模型中的所有模块，并重置所有TokenClusterGating层的专家使用统计数据。
-        """
-        for module in self.modules():
-            if isinstance(module, TokenClusterGating):
-                module.reset_stats()
 
 
 class PatchTSTPredictionHead(nn.Module):
@@ -1518,11 +1213,3 @@ class PatchTSTForPrediction(PatchTSTPreTrainedModel):
             samples = outputs.prediction_outputs.unsqueeze(1)
 
         return SamplePatchTSTOutput(sequences=samples)  # type: ignore
-
-    def reset_moe_stats(self):
-        """
-        遍历模型中的所有模块，并重置所有TokenClusterGating层的专家使用统计数据。
-        """
-        for module in self.modules():
-            if isinstance(module, TokenClusterGating):
-                module.reset_stats()

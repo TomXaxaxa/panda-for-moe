@@ -275,24 +275,45 @@ def evaluate_forecasting_model(
             contexts = np.concatenate(contexts, axis=0)
             
             save_dir = False
+            save_full_prediction = True  # 开关1
+            save_one_shot_prediction = False  # 开关2
             
             if save_dir:
-                # 确保保存目录存在
                 os.makedirs(save_dir, exist_ok=True)
-                # 构建带有时间戳和系统名称的文件路径
-                # `labels` 是真实值 (trues)
-                true_filepath = os.path.join(save_dir, f"{timestamp}_{system}_trues.npy")
-                # `predictions` 是预测值 (preds)
-                pred_filepath = os.path.join(save_dir, f"{timestamp}_{system}_preds.npy")
 
-                # 使用 numpy.save 保存数组
-                np.save(true_filepath, labels)
-                np.save(pred_filepath, predictions)
+                # 开关1：保存完整的预测和真实值
+                if save_full_prediction:
+                    true_filepath = os.path.join(save_dir, f"{timestamp}_{system}_trues.npy")
+                    pred_filepath = os.path.join(save_dir, f"{timestamp}_{system}_preds.npy")
+                    np.save(true_filepath, labels)
+                    np.save(pred_filepath, predictions)
+                    print(f"\nSaved full prediction data for system '{system}':")
+                    print(f"  - Ground truth (trues) saved to: {true_filepath}")
+                    print(f"  - Predictions (preds) saved to: {pred_filepath}")
 
-                # 打印提示信息，方便追踪
-                print(f"\nSaved data for system '{system}':")
-                print(f"  - Ground truth (trues) saved to: {true_filepath}")
-                print(f"  - Predictions (preds) saved to: {pred_filepath}")
+                # 开关2：保存历史输入 + 单次预测 + 对应的真实值
+                if save_one_shot_prediction:
+                    # 获取模型原生的、单次的预测长度
+                    model_pred_len = pipeline.model.config.prediction_length
+                    
+                    # 基于模型单次预测长度，对结果进行切片
+                    one_shot_preds = predictions[:, :model_pred_len, :]
+                    one_shot_labels = labels[:, :model_pred_len, :]
+                    
+                    # 定义文件路径
+                    context_filepath = os.path.join(save_dir, f"{timestamp}_{system}_context.npy")
+                    one_shot_pred_filepath = os.path.join(save_dir, f"{timestamp}_{system}_one_shot_pred.npy")
+                    one_shot_true_filepath = os.path.join(save_dir, f"{timestamp}_{system}_one_shot_true.npy")
+
+                    # 保存Numpy数组
+                    np.save(context_filepath, contexts)
+                    np.save(one_shot_pred_filepath, one_shot_preds)
+                    np.save(one_shot_true_filepath, one_shot_labels)
+
+                    print(f"\nSaved one-shot data for system '{system}':")
+                    print(f"  - Context (history) saved to: {context_filepath}")
+                    print(f"  - One-shot predictions saved to: {one_shot_pred_filepath}")
+                    print(f"  - One-shot ground truth saved to: {one_shot_true_filepath}")
 
             # evaluate metrics for multiple forecast lengths on user-specified subintervals
             # as well as the full prediction length interval

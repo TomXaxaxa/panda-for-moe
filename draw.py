@@ -88,14 +88,28 @@ def analyze_and_plot(base_dir='eval_results/patchtst', models_to_plot=None):
                 pred_steps = int(pred_steps_str)
                 df = pd.read_csv(csv_file)
                 
+                # --- 新增代码 ---
+                # 打印当前正在处理的文件信息，以便追踪
+                print(f"\n=======================================================")
+                print(f"读取文件: {csv_file}")
+                print(f"=======================================================")
+                # --- 新增代码结束 ---
+                
                 for metric in metrics_to_plot:
                     if metric in df.columns:
                         
-                        # --- 关键修改开始 ---
+                        # --- 新增代码 ---
+                        # 打印每个指标的前5个数据
+                        print(f"--- 指标'{metric}'的前5个值 ---")
+                        print(df[metric].head(5))
+                        print("-" * 30)
+                        # --- 新增代码结束 ---
+                        
+                        # --- 原有关键修改开始 ---
                         # 如果指标是 'mse' 或 'mae'，则排除前10%的极端值
                         if metric in ['mse', 'mae']:
                             # 计算要保留的行数（底部90%）
-                            n_rows_to_keep = int(len(df) * 0.85)
+                            n_rows_to_keep = int(len(df) * 1.0)
                             
                             # 对值进行排序，并选择最小的90%
                             sorted_values = df[metric].sort_values()
@@ -103,7 +117,7 @@ def analyze_and_plot(base_dir='eval_results/patchtst', models_to_plot=None):
                         else:
                             # 对于其他指标，正常计算均值
                             mean_val = df[metric].mean()
-                        # --- 关键修改结束 ---
+                        # --- 原有关键修改结束 ---
                             
                         all_results.append({
                             'model': model_name, 
@@ -211,7 +225,7 @@ if __name__ == '__main__':
     # analyze_and_plot(base_dir='eval_results/patchtst')
 
     # 示例2: 只分析和绘制指定的两个模型
-    models_to_run = ['panda256+encoder', 'panda256+encoder+FlashAttention']
+    models_to_run = ['panda256+encoder', 'panda256+encoder+prompt']
     analyze_and_plot(base_dir='eval_results/patchtst', models_to_plot=models_to_run)
     
     # 示例3: 如果目录不存在，脚本将自动创建包含三个模型的虚拟数据并绘图

@@ -15,8 +15,8 @@ model_logs = [
         "path": "./checkpoints/panda256+encoder/logs"  # <-- ‼️ 修改为您的第一个模型的日志目录
     },
     {
-        "name": "panda256+FlashAttention",
-        "path": "./checkpoints/panda256+encoder+FlashAttention/logs" # <-- ‼️ 修改为您的第二个模型的日志目录
+        "name": "panda512+moirai",
+        "path": "./checkpoints/panda512+moirai80/logs" # <-- ‼️ 修改为您的第二个模型的日志目录
     }
     # 如果有更多模型，请像下面这样继续添加
     # {
@@ -88,7 +88,7 @@ if all_loss_data:
     plt.tight_layout() # 调整布局以防止标签重叠
 
     # --- 5. 保存图表 ---
-    output_image_path = "train_loss_comparison(Scale).png"
+    output_image_path = "train_loss_comparison(Scaling).png"
     plt.savefig(output_image_path, dpi=300, bbox_inches='tight')
 
     print(f"\n✅ 图表已成功保存到: {output_image_path}")
