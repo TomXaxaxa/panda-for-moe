@@ -1,29 +1,11 @@
 """Exposed PatchTST model, taken from HuggingFace transformers"""
 
-# ==================== 全局注意力实现控制 ====================
-# 在此处设置要使用的注意力实现。
-# 可选项: "flash_attention_2" 或 "eager" (PyTorch 标准实现)
-_ATTN_IMPLEMENTATION = "flash_attention_2"
-
-# 检查 Flash Attention 2 是否可用
-try:
-    from flash_attn import flash_attn_func
-    _flash_attn_2_available = True
-    if _ATTN_IMPLEMENTATION == "flash_attention_2":
-        print("Flash Attention 2 is available and configured to be used.")
-except ImportError:
-    _flash_attn_2_available = False
-    if _ATTN_IMPLEMENTATION == "flash_attention_2":
-        # 如果配置使用但库不可用，打印警告并自动回退
-        print("Warning: _ATTN_IMPLEMENTATION set to 'flash_attention_2' but flash-attn is not installed. Falling back to 'eager' implementation.")
-        _ATTN_IMPLEMENTATION = "eager"
-# ==========================================================
-
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mamba_ssm import Mamba2
 from transformers import PatchTSTConfig, PatchTSTPreTrainedModel
 from transformers.models.patchtst.modeling_patchtst import (
@@ -51,37 +33,6 @@ from .modules import (
     apply_p_rope_to_qk,
 )
 
-import torch.nn.functional as F
-
-class Memory(nn.Module):
-    """ Memory prompt, copied from UrbanDiT implementation """
-    def __init__(self, num_memory, memory_dim):
-        super().__init__()
-        self.num_memory = num_memory
-        self.memory_dim = memory_dim
-
-        self.memMatrix = nn.Parameter(torch.zeros(num_memory, memory_dim))  # M,C
-        self.keyMatrix = nn.Parameter(torch.zeros(num_memory, memory_dim))  # M,C
-
-        # Initialize weights
-        torch.nn.init.trunc_normal_(self.memMatrix, std=0.02)
-        torch.nn.init.trunc_normal_(self.keyMatrix, std=0.02)
-
-        self.x_proj = nn.Linear(memory_dim, memory_dim)
-
-    def forward(self, x):
-        """
-        :param x: query features with size [N,C], where N is the number of query items,
-                  C is same as dimension of memory slot
-        :return: query output retrieved from memory, with the same size as x.
-        """
-        assert x.shape[-1] == self.memMatrix.shape[-1] == self.keyMatrix.shape[-1], "dimension mismatch"
-
-        x_query = torch.tanh(self.x_proj(x))
-        att_weight = F.linear(input=x_query, weight=self.keyMatrix)  # [N,C] by [M,C]^T --> [N,M]
-        att_weight = F.softmax(att_weight, dim=-1)  # NxM
-        out = F.linear(att_weight, self.memMatrix.permute(1, 0))  # [N,M] by [M,C]  --> [N,C]
-        return {'out': out, 'att_weight': att_weight}
 
 @dataclass
 class CompletionsPatchTSTOutput(ModelOutput):
@@ -91,6 +42,41 @@ class CompletionsPatchTSTOutput(ModelOutput):
     loc: Optional[torch.FloatTensor] = None
     scale: Optional[torch.FloatTensor] = None
 
+class Memory(nn.Module):
+    """ Memory prompt """
+    def __init__(self, num_memory, memory_dim):
+        super().__init__()
+        self.num_memory = num_memory
+        self.memory_dim = memory_dim
+
+        self.memMatrix = nn.Parameter(torch.zeros(num_memory, memory_dim))  # M,C
+        self.keyMatrix = nn.Parameter(torch.zeros(num_memory, memory_dim))  # M,C
+        self.x_proj = nn.Linear(memory_dim, memory_dim)
+
+        self.initialize_weights()
+        print("Initialized Memory (Prompt Network)")
+
+    def initialize_weights(self):
+        torch.nn.init.trunc_normal_(self.memMatrix, std=0.02)
+        torch.nn.init.trunc_normal_(self.keyMatrix, std=0.02)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward(self, x):
+        assert x.shape[-1] == self.memory_dim, "Dimension mismatch in Memory network"
+        x_query = torch.tanh(self.x_proj(x))
+        att_weight = F.linear(input=x_query, weight=self.keyMatrix)
+        att_weight = F.softmax(att_weight, dim=-1)
+        out = F.linear(att_weight, self.memMatrix.permute(1, 0))
+        return out
 
 class PatchTSTEmbedding(nn.Module):
     def __init__(self, config: PatchTSTConfig):
@@ -138,11 +124,6 @@ class PatchTSTRopeAttention(nn.Module):
         self.rope_percent = rope_percent
         self.use_rope = use_rope
         self.config = config
-        
-        # === 新增代码开始 ===
-        # 直接从全局变量读取注意力实现方式
-        self.attn_implementation = _ATTN_IMPLEMENTATION
-        # === 新增代码结束 ===
 
         if (self.head_dim * num_heads) != self.embed_dim:
             raise ValueError(
@@ -176,88 +157,54 @@ class PatchTSTRopeAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
-        linear_attn: bool = False, # 注意: linear_attn 在 Flash Attention 路径中不被使用
+        linear_attn: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
+        # if key_value_states are provided this layer is used as a cross-attention layer
+        # for the decoder
         is_cross_attention = key_value_states is not None
-        
-        # ======================== Flash Attention 2 快速路径 ========================
-        # 仅在满足以下条件时使用 Flash Attention：
-        # 1. 全局开关 _ATTN_IMPLEMENTATION 设置为 "flash_attention_2"
-        # 2. 已成功导入 flash_attn 库 (由全局开关处理)
-        # 3. 未请求输出注意力权重 (output_attentions=False)
-        # 4. 是自注意力，而不是交叉注意力且无缓存
-        if self.attn_implementation == "flash_attention_2" and not output_attentions and not is_cross_attention and past_key_value is None:
-            bsz, tgt_len, _ = hidden_states.size()
-            
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
 
-            # Reshape for Flash Attention: (bsz, seq_len, num_heads, head_dim)
-            query_states = query_states.view(bsz, tgt_len, self.num_heads, self.head_dim)
-            key_states = key_states.view(bsz, tgt_len, self.num_heads, self.head_dim)
-            value_states = value_states.view(bsz, tgt_len, self.num_heads, self.head_dim)
-
-            if self.use_rope:
-                position_ids = self.get_seq_pos(tgt_len, hidden_states.device, hidden_states.dtype)
-                # RoPE 需要 (..., seq_len, dim) 的形状
-                q_for_rope = query_states.contiguous().view(-1, tgt_len, self.head_dim)
-                k_for_rope = key_states.contiguous().view(-1, tgt_len, self.head_dim)
-                
-                k_for_rope, q_for_rope = apply_p_rope_to_qk(
-                    k_for_rope,
-                    q_for_rope,
-                    position_ids,
-                    self.head_dim,
-                    self.max_wavelength,
-                    self.rope_percent,
-                )
-                query_states = q_for_rope.view(bsz, tgt_len, self.num_heads, self.head_dim)
-                key_states = k_for_rope.view(bsz, tgt_len, self.num_heads, self.head_dim)
-
-            attn_output = flash_attn_func(
-                query_states,
-                key_states,
-                value_states,
-                dropout_p=self.dropout if self.training else 0.0,
-                softmax_scale=self.scaling,
-                causal=self.is_causal,
-            )
-
-            attn_output = attn_output.reshape(bsz, tgt_len, self.embed_dim)
-            attn_output = self.out_proj(attn_output)
-
-            return attn_output, None, None
-
-        # ======================== 原始 Eager Attention 逻辑 (回退路径) ========================
         bsz, tgt_len, _ = hidden_states.size()
 
         # get query proj
         query_states = self.q_proj(hidden_states) * self.scaling
         # get key, value proj
+        # `past_key_value[0].shape[2] == key_value_states.shape[1]`
+        # is checking that the `sequence_length` of the `past_key_value` is the same as
+        # the provided `key_value_states` to support prefix tuning
         if (
             is_cross_attention
             and past_key_value is not None
             and past_key_value[0].shape[2] == key_value_states.shape[1]
         ):
+            # reuse k,v, cross_attentions
             key_states = past_key_value[0]
-            value_states = past_key_value[1]
+            value_states = past_key_value[1]  # type: ignore
         elif is_cross_attention:
+            # cross_attentions
             key_states = self._shape(self.k_proj(key_value_states), -1, bsz)
             value_states = self._shape(self.v_proj(key_value_states), -1, bsz)
         elif past_key_value is not None:
+            # reuse k, v, self_attention
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)  # type: ignore
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)  # type: ignore
         else:
+            # self_attention
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
 
         if self.is_decoder:
-            past_key_value = (key_states, value_states)
+            # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
+            # Further calls to cross_attention layer can then reuse all cross-attention
+            # key/value_states (first "if" case)
+            # if uni-directional self-attention (decoder) save Tuple(torch.Tensor, torch.Tensor) of
+            # all previous decoder key/value_states. Further calls to uni-directional self-attention
+            # can concat previous decoder key/value_states to current projected key/value_states (third "elif" case)
+            # if encoder bi-directional self-attention `past_key_value` is always `None`
+            past_key_value = (key_states, value_states)  # type: ignore
 
         proj_shape = (bsz * self.num_heads, -1, self.head_dim)
         query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
@@ -265,8 +212,11 @@ class PatchTSTRopeAttention(nn.Module):
         value_states = value_states.reshape(*proj_shape)
         src_len = key_states.size(1)
 
+        # apply rotary positional embeddings
         if self.use_rope:
-            position_ids = self.get_seq_pos(src_len, key_states.device, key_states.dtype)
+            position_ids = self.get_seq_pos(
+                src_len, key_states.device, key_states.dtype
+            )
             key_states, query_states = apply_p_rope_to_qk(
                 key_states,
                 query_states,
@@ -309,6 +259,10 @@ class PatchTSTRopeAttention(nn.Module):
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
         if output_attentions:
+            # this operation is a bit awkward, but it's required to
+            # make sure that attn_weights keeps its gradient.
+            # In order to do so, attn_weights have to be reshaped
+            # twice and have to be reused in the following
             attn_weights_reshaped = attn_weights.view(
                 bsz, self.num_heads, tgt_len, src_len
             )
@@ -332,7 +286,11 @@ class PatchTSTRopeAttention(nn.Module):
 
         attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
         attn_output = attn_output.transpose(1, 2)
+
+        # Use the `embed_dim` from the config (stored in the class) rather than `hidden_state` because `attn_output` can be
+        # partitioned across GPUs when using tensor-parallelism.
         attn_output = attn_output.reshape(bsz, tgt_len, self.embed_dim)
+
         attn_output = self.out_proj(attn_output)
 
         return attn_output, attn_weights_reshaped, past_key_value
@@ -587,7 +545,6 @@ class PatchTSTEncoder(PatchTSTPreTrainedModel):
     def forward(
         self,
         patch_input: torch.Tensor,
-        prompt_tokens: Optional[torch.Tensor] = None, # <--- 新增参数
         channel_attention_mask: Optional[torch.Tensor] = None,
         output_hidden_states: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -617,14 +574,6 @@ class PatchTSTEncoder(PatchTSTPreTrainedModel):
         # Input embedding
         patch_input = self.embedder(patch_input)
         hidden_state = patch_input
-        
-        # === 新增代码开始 ===
-        # Prepend prompt tokens to the sequence if they exist
-        if prompt_tokens is not None:
-            # hidden_state shape: (bs, num_channels, num_patches, d_model)
-            # prompt_tokens shape: (bs, num_channels, 1, d_model)
-            hidden_state = torch.cat((prompt_tokens, hidden_state), dim=2)
-        # === 新增代码结束 ===
 
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
@@ -667,16 +616,6 @@ class PatchTSTModel(PatchTSTPreTrainedModel):
         else:
             self.masking = nn.Identity()
         self.encoder = PatchTSTEncoder(config)
-        
-        # === 新增代码开始 ===
-        # Hardcoded hyperparameters for the prompt network
-        num_memory = 512
-        # The length of the real part of FFT result for the time series
-        fft_input_dim = config.context_length // 2 + 1 
-
-        self.fft_proj = nn.Linear(fft_input_dim, config.d_model)
-        self.freq_memory_prompt = Memory(num_memory=num_memory, memory_dim=config.d_model)
-        # === 新增代码结束 ===
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -734,25 +673,6 @@ class PatchTSTModel(PatchTSTPreTrainedModel):
             past_observed_mask = torch.ones_like(past_values)
 
         scaled_past_values, loc, scale = self.scaler(past_values, past_observed_mask)
-        
-        # === 新增代码开始 ===
-        # Generate prompt from FFT features
-        # past_values shape: (bs, sequence_length, num_input_channels)
-        bs, seq_len, n_channels = past_values.shape
-
-        # 1. Calculate FFT
-        # Transpose to (bs, num_input_channels, sequence_length) for batch FFT
-        fft_features = torch.fft.rfft(scaled_past_values.transpose(1, 2), dim=-1).real
-
-        # 2. Project FFT features to query dimension
-        fft_query = self.fft_proj(fft_features) # Shape: (bs, n_channels, d_model)
-
-        # 3. Retrieve prompt from memory
-        prompt_tokens = self.freq_memory_prompt(fft_query.reshape(-1, self.config.d_model))['out']
-        # Reshape to (bs, n_channels, 1, d_model) to act as a single prompt token per channel
-        prompt_tokens = prompt_tokens.reshape(bs, n_channels, 1, self.config.d_model)
-        # === 新增代码结束 ===
-        
         patched_values = self.patchifier(scaled_past_values)
 
         if self.do_mask_input:
@@ -762,7 +682,6 @@ class PatchTSTModel(PatchTSTPreTrainedModel):
 
         encoder_output = self.encoder(
             patch_input=masked_values,
-            prompt_tokens=prompt_tokens,
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             channel_attention_mask=channel_attention_mask,
@@ -971,6 +890,8 @@ class PatchTSTPredictionHead(nn.Module):
         self, config: PatchTSTConfig, num_patches: int = 1, distribution_output=None
     ):
         super().__init__()
+        
+        self.use_prompt_network = getattr(config, "use_prompt_network", False)
 
         self.use_cls_token = config.use_cls_token
         self.pooling_type = config.pooling_type
@@ -979,22 +900,27 @@ class PatchTSTPredictionHead(nn.Module):
         else:  # included for completeness
             # num_patches is set to a dummy value,
             head_dim = config.d_model * num_patches
+            
+        if self.use_prompt_network:
+            final_head_dim = head_dim * 2
+        else:
+            final_head_dim = head_dim
 
         # all the channels share the same head
         self.flatten = nn.Flatten(start_dim=2)
         if distribution_output is None:
             # use linear head with custom weight initialization
-            self.projection = nn.Linear(head_dim, config.prediction_length, bias=False)
+            self.projection = nn.Linear(final_head_dim, config.prediction_length, bias=False)
         else:
             # use distribution head
-            self.projection = distribution_output.get_parameter_projection(head_dim)
+            self.projection = distribution_output.get_parameter_projection(final_head_dim)
         self.dropout = (
             nn.Dropout(config.head_dropout)
             if config.head_dropout > 0
             else nn.Identity()
         )
 
-    def forward(self, embedding: torch.Tensor):
+    def forward(self, embedding: torch.Tensor, prompt_embedding: Optional[torch.Tensor] = None):
         """
         Parameters:
             embedding (`torch.Tensor` of shape `(bs, num_channels, num_patches, d_model)` or
@@ -1024,7 +950,13 @@ class PatchTSTPredictionHead(nn.Module):
 
         # output: [bs x num_channels x forecast_len] or
         # tuple ([bs x num_channels x forecast_len], [bs x num_channels x forecast_len]) if using distribution head
-        output = self.projection(pooled_embedding)
+        if self.use_prompt_network and prompt_embedding is not None:
+            # Concatenate the model's output with the prompt
+            # prompt_embedding shape: (bs, num_channels, d_model)
+            combined_embedding = torch.cat([pooled_embedding, prompt_embedding], dim=-1)
+            output = self.projection(combined_embedding)
+        else:
+            output = self.projection(pooled_embedding)
 
         if isinstance(output, tuple):
             # output: ([bs x forecast_len x num_channels], [bs x forecast_len x num_channels])
@@ -1038,8 +970,25 @@ class PatchTSTForPrediction(PatchTSTPreTrainedModel):
     def __init__(self, config: PatchTSTConfig):
         super().__init__(config)
 
+        self.use_prompt_network = getattr(config, "use_prompt_network", False)
+
         # Turn off masking
         config.do_mask_input = False
+
+        if self.use_prompt_network:
+            # Hardcoded hyperparameters as requested
+            num_memory = 128
+            # FFT length depends on context length, ensure it's calculated correctly
+            # Example: for sequence length 512, rfft gives 257 frequency bins.
+            # (context_length // 2 + 1) * num_input_channels * 2 (real+imag)
+            # This is highly dependent on your data, so we'll make it flexible
+            # but for now, let's assume a projector from a large-ish number.
+            # A more robust way is to calculate this dynamically. Let's make it simple.
+            fft_feature_dim = (config.context_length // 2 + 1) * 2
+            
+            self.fft_projector = nn.Linear(fft_feature_dim, config.d_model)
+            self.prompt_network = Memory(num_memory=num_memory, memory_dim=config.d_model)
+        # --- End of modifications ---
 
         self.model = PatchTSTModel(config)
 
@@ -1111,6 +1060,39 @@ class PatchTSTForPrediction(PatchTSTPreTrainedModel):
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
+        
+        prompt_embedding = None
+        if self.use_prompt_network:
+            # past_values: [bs, seq_len, num_channels]
+            # 1. Compute FFT
+            # Permute to (bs, num_channels, seq_len) for FFT along the time axis
+            fft_features = torch.fft.rfft(past_values.permute(0, 2, 1), n=past_values.shape[1], dim=-1)
+            # fft_features: [bs, num_channels, freq_bins] (complex)
+            
+            # 2. Process FFT features (real and imag parts)
+            fft_features = torch.cat([fft_features.real, fft_features.imag], dim=-1)
+            # fft_features: [bs, num_channels, freq_bins * 2]
+            
+            # We need to project this to d_model. The dimension can vary.
+            # A simple approach is to use an adaptive pooling layer or a flatten + linear.
+            # Let's flatten and project.
+            bs, num_channels, _ = fft_features.shape
+            fft_features_flat = fft_features.reshape(bs * num_channels, -1)
+            
+            # This is where the fft_feature_dim in __init__ must match.
+            # If it doesn't match, you'll need to adjust the Linear layer or pad/truncate here.
+            # For simplicity, let's assume it's correctly sized or add padding.
+            if fft_features_flat.shape[1] > self.fft_projector.in_features:
+                fft_features_flat = fft_features_flat[:, :self.fft_projector.in_features]
+            elif fft_features_flat.shape[1] < self.fft_projector.in_features:
+                padding = torch.zeros(fft_features_flat.shape[0], self.fft_projector.in_features - fft_features_flat.shape[1], device=fft_features_flat.device)
+                fft_features_flat = torch.cat([fft_features_flat, padding], dim=1)
+
+            projected_fft = self.fft_projector(fft_features_flat) # (bs*num_channels, d_model)
+            
+            # 3. Generate Prompt
+            prompt = self.prompt_network(projected_fft) # (bs*num_channels, d_model)
+            prompt_embedding = prompt.reshape(bs, num_channels, -1) # (bs, num_channels, d_model)
 
         # get model output
         model_output = self.model(
@@ -1122,7 +1104,7 @@ class PatchTSTForPrediction(PatchTSTPreTrainedModel):
             return_dict=True,
             linear_attn=linear_attn,
         )
-        y_hat = self.head(model_output.last_hidden_state)
+        y_hat = self.head(model_output.last_hidden_state, prompt_embedding=prompt_embedding)
 
         if self.distribution_output:
             y_hat_out = y_hat

@@ -19,6 +19,7 @@ from panda.augmentations import (
     StandardizeTransform,
 )
 from panda.patchtst.dataset import TimeSeriesDataset
+# 确保导入了 PatchTSTForPrediction 以便在第二阶段加载模型
 from panda.patchtst.patchtst import (
     PatchTSTForPrediction,
     PatchTSTForPretraining,
@@ -37,8 +38,6 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
-
-from panda.patchtst.modules import PatchTSTRMSNorm
 
 import wandb
 
@@ -81,76 +80,28 @@ class CustomTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
 
-def setup_model_for_stage2_training(model):
-    """
-    Freezes the main transformer blocks and keeps only the specified layers trainable.
-    """
-    log_on_main("--- Setting up model for Stage 2 training ---", logger)
-    
-    # First, freeze all parameters in the model
-    for param in model.parameters():
-        param.requires_grad = False
-    
-    # Specifically unfreeze the parameters of the prompt network and other specified layers
-    # Note: Accessing nested modules might require careful path inspection
-    # Based on our previous changes to PatchTSTModel
-    if hasattr(model.model, 'fft_proj'):
-        for param in model.model.fft_proj.parameters():
-            param.requires_grad = True
-        log_on_main("Unfroze fft_proj parameters.", logger)
-
-    if hasattr(model.model, 'freq_memory_prompt'):
-        for param in model.model.freq_memory_prompt.parameters():
-            param.requires_grad = True
-        log_on_main("Unfroze freq_memory_prompt parameters.", logger)
-
-
-    # Unfreeze embedding layer
-    if hasattr(model.model.encoder, 'embedder'):
-        for param in model.model.encoder.embedder.parameters():
-            param.requires_grad = True
-        log_on_main("Unfroze encoder.embedder parameters.", logger)
-            
-    # Unfreeze all normalization layers
-    for name, module in model.named_modules():
-        if isinstance(module, (torch.nn.LayerNorm, PatchTSTRMSNorm)):
-            for param in module.parameters():
-                param.requires_grad = True
-    log_on_main("Unfroze all LayerNorm and PatchTSTRMSNorm parameters.", logger)
-
-
-    # Log the number of trainable parameters to confirm our setup
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    log_on_main(f"Stage 2: Trainable parameters: {trainable_params:,} (out of {total_params:,})", logger)
-    
-    return model
-
-
 @hydra.main(config_path="../../config", config_name="config", version_base=None)
 def main(cfg):
-    # set up wandb project and logging if enabled
+    # =========================================================================
+    # == 1. 初始化设置 (W&B, 日志, 随机种子, 精度等)
+    # =========================================================================
     if cfg.wandb.log and is_main_process():
         run = wandb.init(
             project=cfg.wandb.project_name,
             entity=cfg.wandb.entity,
             name=cfg.run_name,
             config=dict(cfg),
-            sync_tensorboard=False,  # auto-upload tensorboard metrics
+            sync_tensorboard=False,
             group=cfg.wandb.group_name,
             resume=cfg.wandb.resume,
             id=cfg.wandb.resume_run_id,
         )
         log_on_main(f"Wandb initialized: {run.id}", logger)
 
-    # set floating point precision
     use_tf32 = cfg.train.tf32
     if use_tf32 and not (
         torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
     ):
-        # TF32 floating point format is available only on NVIDIA GPUs
-        # with compute capability 8 and above. See link for details.
-        # https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#compute-capability-8-x
         log_on_main(
             "TF32 format is only available on devices with compute capability >= 8. "
             "Setting tf32 to False.",
@@ -158,11 +109,20 @@ def main(cfg):
         )
         use_tf32 = False
 
-    # set random seed
     log_on_main(f"Using SEED: {cfg.train.seed}", logger)
     transformers.set_seed(seed=cfg.train.seed)
 
-    # get train data paths
+    output_dir = get_next_path(
+        cfg.run_name if cfg.run_name else "run",
+        base_dir=Path(cfg.train.output_dir),
+        file_type="",
+        overwrite=cfg.train.resume_from_checkpoint is not None,
+    )
+    log_on_main(f"Logging dir: {output_dir}", logger)
+    
+    # =========================================================================
+    # == 2. 数据集准备 (加载, 过滤, 增强)
+    # =========================================================================
     train_data_dir_lst = cfg.train_data_dirs
     train_data_paths = []
     for train_data_dir in train_data_dir_lst:
@@ -170,15 +130,7 @@ def main(cfg):
         train_data_paths.extend(
             filter(lambda file: file.is_file(), Path(train_data_dir).rglob("*"))
         )
-    # create a new output directory to save results
-    output_dir = get_next_path(
-        cfg.run_name if cfg.run_name else "run",
-        base_dir=Path(cfg.train.output_dir),
-        file_type="",
-        overwrite=cfg.train.resume_from_checkpoint is not None,
-    )
-
-    log_on_main(f"Logging dir: {output_dir}", logger)
+    
     log_on_main(
         f"Loading and filtering {len(train_data_paths)} datasets for training from directories: {train_data_dir_lst}",
         logger,
@@ -191,12 +143,11 @@ def main(cfg):
                 min_length=cfg.min_past + cfg.patchtst.prediction_length,
                 max_missing_prop=cfg.max_missing_prop,
             ),
-            FileDataset(path=Path(data_path), freq="h", one_dim_target=False),  # type: ignore
+            FileDataset(path=Path(data_path), freq="h", one_dim_target=False),
         )
         for data_path in train_data_paths
     ]
 
-    # set probabilities (how we weight draws from each data file)
     if isinstance(cfg.probability, float):
         probability = cfg.probability
     elif cfg.probability is None:
@@ -204,7 +155,6 @@ def main(cfg):
     assert isinstance(probability, list)
     assert len(train_datasets) == len(probability)
 
-    # adapt number of workers to the number of datasets if there are more workers than datasets
     dataloader_num_workers = cfg.train.dataloader_num_workers
     if dataloader_num_workers > len(train_datasets):
         log_on_main(
@@ -241,25 +191,19 @@ def main(cfg):
         ),
     ]
     if cfg.augmentations.probabilities is None:
-        cfg.augmentations.probabilities = [1.0 / len(augmentations)] * len(
-            augmentations
-        )
-    else:  # ensure probabilities sum to 1
+        cfg.augmentations.probabilities = [1.0 / len(augmentations)] * len(augmentations)
+    else:
         cfg.augmentations.probabilities = [
             prob / sum(cfg.augmentations.probabilities)
             for prob in cfg.augmentations.probabilities
         ]
-
-    log_on_main(
-        f"Using augmentations: {[aug for aug, prob in zip(augmentations, cfg.augmentations.probabilities) if prob > 0.0]}",
-        logger,
-    )
 
     transforms: list = [
         StandardizeTransform(),
         RandomDimSelectionTransform(num_dims=cfg.fixed_dim),
     ]
 
+    # 这个数据集将被两个训练阶段共享
     shuffled_train_dataset = TimeSeriesDataset(
         datasets=train_datasets,
         probabilities=probability,
@@ -273,31 +217,32 @@ def main(cfg):
         transforms=transforms,
     ).shuffle(shuffle_buffer_length=cfg.shuffle_buffer_length)
 
-    if (
-        cfg.patchtst.mode == "predict"
-        and cfg.patchtst.pretrained_encoder_path is not None
-    ):
-        log_on_main(
-            f"Loading pretrained encoder from {cfg.patchtst.pretrained_encoder_path}",
-            logger,
-        )
 
-    log_on_main("Initializing model", logger)
+    # =========================================================================
+    # == STAGE 1: 预训练基础 Transformer 模型
+    # =========================================================================
+    log_on_main("="*80, logger)
+    log_on_main("== 开始第一阶段: 预训练基础模型 ==", logger)
+    log_on_main("="*80, logger)
 
-    model = load_patchtst_model(
+    # 确保在第一阶段禁用 prompt network
+    cfg.patchtst.use_prompt_network = False
+    
+    log_on_main("Initializing model for Stage 1", logger)
+    model_stage1 = load_patchtst_model(
         mode=cfg.patchtst.mode,
         model_config=dict(cfg.patchtst),
         pretrained_encoder_path=cfg.patchtst.pretrained_encoder_path,
         pretained_checkpoint=cfg.patchtst.pretrained_pft_path,
     )
 
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log_on_main(f"Total trainable parameters: {trainable_params:,}", logger)
+    trainable_params_s1 = sum(p.numel() for p in model_stage1.parameters() if p.requires_grad)
+    log_on_main(f"第一阶段可训练参数量: {trainable_params_s1:,}", logger)
 
-    # Define training args
-    training_args = TrainingArguments(
-        run_name=cfg.run_name,
-        output_dir=str(output_dir),
+    output_dir_s1 = Path(output_dir) / "stage1"
+    training_args_s1 = TrainingArguments(
+        run_name=f"{cfg.run_name}-S1",
+        output_dir=str(output_dir_s1),
         per_device_train_batch_size=cfg.train.per_device_train_batch_size,
         learning_rate=cfg.train.learning_rate,
         lr_scheduler_type=cfg.train.lr_scheduler_type,
@@ -306,156 +251,156 @@ def main(cfg):
         weight_decay=cfg.train.weight_decay,
         optim=cfg.train.optim,
         log_on_each_node=False,
-        logging_dir=str(output_dir / "logs")
-        if not (cfg.wandb.log and is_main_process())
-        else f"wandb/{run.name}_{run.id}/logs",
+        logging_dir=str(output_dir_s1 / "logs"),
         logging_strategy="steps",
         logging_steps=cfg.train.log_steps,
         save_strategy="steps",
         save_steps=cfg.train.save_steps,
         report_to=["wandb"] if cfg.wandb.log else ["tensorboard"],
-        max_steps=cfg.train.max_steps,
+        max_steps=cfg.train.max_steps, # 使用配置中的max_steps
         gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
         dataloader_num_workers=dataloader_num_workers,
         dataloader_prefetch_factor=cfg.train.dataloader_prefetch_factor,
-        tf32=use_tf32,  # remove this if not using Ampere GPUs (e.g., A100)
-        bf16=True,      # using only when flash attention is enabled
+        tf32=use_tf32,
+        bf16=True,
         torch_compile=cfg.train.torch_compile,
         ddp_find_unused_parameters=cfg.train.ddp_find_unused_parameters,
         ddp_backend=cfg.train.ddp_backend,
         remove_unused_columns=cfg.train.remove_unused_columns,
         seed=cfg.train.seed,
         resume_from_checkpoint=cfg.train.resume_from_checkpoint,
+        push_to_hub=False,
     )
 
-    # check if model weights are contiguous in memory; if not, make them contiguous tensors.
-    # This speeds up training and allows checkpoint saving by transformers Trainer
-    ensure_contiguous(model)
+    ensure_contiguous(model_stage1)
 
+    # 根据配置设置训练器 (带或不带自定义调度器)
     scheduler_args = dict(cfg.scheduler)
-    scheduler_enabled = scheduler_args.pop("enabled", False)
-    
-    if scheduler_enabled:
-        log_on_main(
-            f"Using {scheduler_args['schedule_name']} scheduler for {scheduler_args['schedule_value_name']}",
-            logger,
-        )
-        value_name = scheduler_args.pop("schedule_value_name", "schedule_param")
+    if scheduler_args.pop("enabled", False):
         scheduler = Scheduler(**scheduler_args)
-
-        logging_callback = SchedulerLoggingCallback(
-            scheduler=scheduler,
-            logger=logger,
-            log_interval=cfg.train.log_steps,
-            log_value_name=value_name,
-        )
-        trainer = CustomTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=shuffled_train_dataset,
-            scheduler=scheduler,
-            callbacks=[logging_callback],
+        logging_callback = SchedulerLoggingCallback(scheduler=scheduler, logger=logger, log_interval=cfg.train.log_steps)
+        trainer_stage1 = CustomTrainer(
+            model=model_stage1, args=training_args_s1, train_dataset=shuffled_train_dataset,
+            scheduler=scheduler, callbacks=[logging_callback]
         )
     else:
-        trainer = Trainer(
-            model=model, args=training_args, train_dataset=shuffled_train_dataset
+        trainer_stage1 = Trainer(
+            model=model_stage1, args=training_args_s1, train_dataset=shuffled_train_dataset
         )
-
-    # === STAGE 1: FULL MODEL TRAINING ===
-    log_on_main("--- Starting Stage 1: Training all model parameters ---", logger)
     
-    # --- 用于从断点恢复的临时修改：开始 ---
-    # 由于第一阶段已经完成，我们注释掉它的训练过程以直接进入第二阶段
-    log_on_main("--- SKIPPING Stage 1 training to resume at Stage 2 ---", logger)
-    # trainer.train(
-    #     resume_from_checkpoint=cfg.train.resume_from_checkpoint
-    # ) 
-    # --- 用于从断点恢复的临时修改：结束 ---
+    log_on_main("开始第一阶段训练...", logger)
+    trainer_stage1.train(resume_from_checkpoint=cfg.train.resume_from_checkpoint)
 
-    # 原始代码（已注释掉，供参考）:
-    # trainer.train(
-    #     resume_from_checkpoint=cfg.train.resume_from_checkpoint
-    # )
+    stage1_final_checkpoint = Path(output_dir_s1) / "checkpoint-final"
+    if is_main_process():
+        model_stage1.save_pretrained(stage1_final_checkpoint)
+        log_on_main(f"第一阶段模型已保存至: {stage1_final_checkpoint}", logger)
+        
+    torch.distributed.barrier()
 
-    # 即使跳过了训练，我们仍然需要定义第一阶段检查点文件夹的路径
-    stage1_final_checkpoint_dir = output_dir / "checkpoint-final-stage1"
+
+    # =========================================================================
+    # == STAGE 2: 微调 Prompt Network
+    # =========================================================================
+    log_on_main("\n" + "="*80, logger)
+    log_on_main("== 开始第二阶段: 微调 Prompt Network ==", logger)
+    log_on_main("="*80, logger)
+
+    # 为第二阶段启用 prompt network
+    cfg.patchtst.use_prompt_network = True
     
-    # 这部分保存代码在跳过训练时不会执行，是正常的
-    if is_main_process() and trainer.state.is_world_process_zero and not os.path.exists(stage1_final_checkpoint_dir):
-         log_on_main(f"Saving final Stage 1 model to {stage1_final_checkpoint_dir}", logger)
-         # model.save_pretrained(stage1_final_checkpoint_dir) # 在跳过时，模型未训练，无需保存
-
-    log_on_main("--- Stage 1 Training Finished (or Skipped) ---", logger)
-
-    # === STAGE 2: FINE-TUNING PROMPT NETWORK & EMBEDDINGS ===
-    log_on_main("--- Starting Stage 2: Fine-tuning specified layers ---", logger)
-
-    # 1. Reload the model from Stage 1
-    # --- 用于从断点恢复的临时修改：开始 ---
-    # !!! 重要：请将下面的路径替换为你第一阶段实际的输出路径 !!!
-    stage1_checkpoint_path = "./checkpoints/run-75/checkpoint-final-stage1" 
-    log_on_main(f"Loading model from Stage 1 checkpoint: {stage1_checkpoint_path}", logger)
-    model = load_patchtst_model(
-        mode=cfg.patchtst.mode,
-        model_config=dict(cfg.patchtst),
-        pretained_checkpoint=stage1_checkpoint_path, # 使用你指定的路径
+    # 必须从第一阶段的checkpoint加载模型
+    # `strict=False` 很重要, 因为 prompt network 的权重是新初始化的, 不在 checkpoint 中
+    log_on_main(f"从 {stage1_final_checkpoint} 加载模型用于第二阶段...", logger)
+    # 更新config以确保模型在加载时知道要构建prompt network
+    model_stage1.config.use_prompt_network = True
+    model_stage2 = PatchTSTForPrediction.from_pretrained(
+        stage1_final_checkpoint,
+        config=model_stage1.config,
+        ignore_mismatched_sizes=True,
+        local_files_only=True
     )
-    # --- 用于从断点恢复的临时修改：结束 ---
-
-    # 原始代码（已注释掉，供参考）:
-    # log_on_main(f"Loading model from Stage 1 checkpoint: {stage1_final_checkpoint_dir}", logger)
-    # model = load_patchtst_model(
-    #     mode=cfg.patchtst.mode,
-    #     model_config=dict(cfg.patchtst),
-    #     pretained_checkpoint=str(stage1_final_checkpoint_dir),
-    # )
     
-    ensure_contiguous(model)
+    log_on_main("为第二阶段冻结 Transformer 层...", logger)
+    for name, param in model_stage2.named_parameters():
+        param.requires_grad = False # 首先冻结所有参数
+        
+        # 然后解冻需要的层
+        if "prompt_network" in name or "fft_projector" in name or "head.projection" in name:
+            param.requires_grad = True
+        if "norm" in name.lower():
+            param.requires_grad = True
+        if "embedder" in name or "patchifier" in name or "scaler" in name:
+            param.requires_grad = True
+            
+    trainable_params_s2 = sum(p.numel() for p in model_stage2.parameters() if p.requires_grad)
+    log_on_main(f"第二阶段可训练参数量: {trainable_params_s2:,}", logger)
 
-    # 2. Freeze the transformer layers and set up for Stage 2
-    model = setup_model_for_stage2_training(model)
+    output_dir_s2 = Path(output_dir) / "stage2"
+    # 为第二阶段微调设置独立的训练参数 (更小的学习率, 不同的步数)
+    training_args_s2 = TrainingArguments(
+        run_name=f"{cfg.run_name}-S2-Prompt",
+        output_dir=str(output_dir_s2),
+        per_device_train_batch_size=cfg.train.per_device_train_batch_size,
+        # 建议为第二阶段在config中设置独立的学习率和步数
+        learning_rate=cfg.train.learning_rate / 2500,
+        max_steps=cfg.train.max_steps,
+        # 复制其他通用参数
+        lr_scheduler_type=cfg.train.lr_scheduler_type,
+        warmup_ratio=cfg.train.warmup_ratio,
+        max_grad_norm=cfg.train.max_grad_norm,
+        weight_decay=cfg.train.weight_decay,
+        optim=cfg.train.optim,
+        log_on_each_node=False,
+        logging_dir=str(output_dir_s2 / "logs"),
+        logging_strategy="steps",
+        logging_steps=cfg.train.log_steps,
+        save_strategy="steps",
+        save_steps=cfg.train.save_steps,
+        report_to=["wandb"] if cfg.wandb.log else ["tensorboard"],
+        gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
+        dataloader_num_workers=dataloader_num_workers,
+        dataloader_prefetch_factor=cfg.train.dataloader_prefetch_factor,
+        tf32=use_tf32,
+        bf16=True,
+        torch_compile=cfg.train.torch_compile,
+        ddp_find_unused_parameters=cfg.train.ddp_find_unused_parameters,
+        ddp_backend=cfg.train.ddp_backend,
+        remove_unused_columns=cfg.train.remove_unused_columns,
+        seed=cfg.train.seed,
+        push_to_hub=False,
+    )
 
-    # 3. Create a new output directory and TrainingArguments for Stage 2
-    stage2_output_dir = output_dir / "stage2_finetune"
-    stage2_output_dir.mkdir(exist_ok=True, parents=True)
-    
-    stage2_training_args_dict = training_args.to_dict()
-    stage2_training_args_dict['output_dir'] = str(stage2_output_dir)
-    stage2_training_args_dict['resume_from_checkpoint'] = None
-    
-    stage2_training_args = TrainingArguments(**stage2_training_args_dict)
+    ensure_contiguous(model_stage2)
 
-    # 4. Instantiate a new Trainer for Stage 2
-    if scheduler_enabled:
+    # 第二阶段通常不需要复杂的学习率调度器, 但我们保持结构一致
+    if scheduler_args.get("enabled", False):
+        scheduler_s2 = Scheduler(**scheduler_args)
+        logging_callback_s2 = SchedulerLoggingCallback(scheduler=scheduler_s2, logger=logger, log_interval=cfg.train.log_steps)
         trainer_stage2 = CustomTrainer(
-            model=model,
-            args=stage2_training_args,
-            train_dataset=shuffled_train_dataset,
-            scheduler=scheduler,
-            callbacks=[logging_callback],
+            model=model_stage2, args=training_args_s2, train_dataset=shuffled_train_dataset,
+            scheduler=scheduler_s2, callbacks=[logging_callback_s2]
         )
     else:
         trainer_stage2 = Trainer(
-            model=model, args=stage2_training_args, train_dataset=shuffled_train_dataset
+            model=model_stage2, args=training_args_s2, train_dataset=shuffled_train_dataset
         )
-    
-    # 5. Run Stage 2 training
-    log_on_main("Starting Stage 2 training loop", logger)
-    trainer_stage2.train()
 
-    # 6. Save the final fine-tuned model
+    log_on_main("开始第二阶段训练...", logger)
+    trainer_stage2.train() # 第二阶段从头开始训练, 不恢复
+
     if is_main_process():
-        final_stage2_dir = stage2_output_dir / "checkpoint-final"
-        model.save_pretrained(final_stage2_dir)
+        final_model_dir = Path(output_dir) / "checkpoint-final"
+        model_stage2.save_pretrained(final_model_dir)
         save_training_info(
-            final_stage2_dir,
+            final_model_dir,
             model_config=OmegaConf.to_container(cfg.patchtst, resolve=True),
             train_config=OmegaConf.to_container(cfg.train, resolve=True),
             all_config=OmegaConf.to_container(cfg, resolve=True),
         )
+        log_on_main(f"最终微调后的模型已保存至: {final_model_dir}", logger)
 
-    # terminate wandb run after training
-    if cfg.wandb.log and is_main_process():
+    if cfg.wandb.log:
         wandb.finish(exit_code=0)
 
 
