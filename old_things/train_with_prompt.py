@@ -288,13 +288,16 @@ def main(cfg):
             model=model_stage1, args=training_args_s1, train_dataset=shuffled_train_dataset
         )
     
-    log_on_main("开始第一阶段训练...", logger)
-    trainer_stage1.train(resume_from_checkpoint=cfg.train.resume_from_checkpoint)
+    # log_on_main("开始第一阶段训练...", logger)
+    # trainer_stage1.train(resume_from_checkpoint=cfg.train.resume_from_checkpoint)
 
-    stage1_final_checkpoint = Path(output_dir_s1) / "checkpoint-final"
-    if is_main_process():
-        model_stage1.save_pretrained(stage1_final_checkpoint)
-        log_on_main(f"第一阶段模型已保存至: {stage1_final_checkpoint}", logger)
+    # stage1_final_checkpoint = Path(output_dir_s1) / "checkpoint-final"
+    
+    stage1_final_checkpoint = './checkpoints/run-52/stage1/checkpoint-final'
+    
+    # if is_main_process():
+    #     model_stage1.save_pretrained(stage1_final_checkpoint)
+    #     log_on_main(f"第一阶段模型已保存至: {stage1_final_checkpoint}", logger)
         
     torch.distributed.barrier()
 
@@ -343,7 +346,7 @@ def main(cfg):
         output_dir=str(output_dir_s2),
         per_device_train_batch_size=cfg.train.per_device_train_batch_size,
         # 建议为第二阶段在config中设置独立的学习率和步数
-        learning_rate=cfg.train.learning_rate / 2500,
+        learning_rate=cfg.train.learning_rate / 10,
         max_steps=cfg.train.max_steps,
         # 复制其他通用参数
         lr_scheduler_type=cfg.train.lr_scheduler_type,

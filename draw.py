@@ -3,6 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
+from matplotlib.patches import Rectangle # 引入Rectangle用于绘制矩形框
 
 def create_dummy_data(base_dir, models):
     """
@@ -33,8 +34,8 @@ def create_dummy_data(base_dir, models):
                 'system': np.arange(20),
                 'mse': mse_values,
                 'mae': mae_values,
-                'smape': np.random.rand(20), # SMAPE 通常在0-200之间
-                'spearman': np.random.rand(20) * 0.5 + 0.2,
+                'smape': np.random.rand(20) * 80 + 10, # SMAPE 通常在0-200之间
+                'spearman': np.random.rand(20) * 0.6 + 0.2,
                 'system_dims': np.random.randint(1, 5, 20),
                 'n_system_samples': np.random.randint(100, 200, 20)
             }
@@ -45,14 +46,7 @@ def create_dummy_data(base_dir, models):
 
 def analyze_and_plot(base_dir='eval_results/patchtst', models_to_plot=None):
     """
-    分析指定目录中的实验结果并生成图表。
-
-    Args:
-        base_dir (str, optional): 包含模型结果的根目录。
-                                  默认为 'eval_results/patchtst'。
-        models_to_plot (list, optional): 一个字符串列表，指定要绘制哪些模型。
-                                         如果为 None，则自动检测 `base_dir` 下的所有模型。
-                                         默认为 None。
+    分析指定目录中的实验结果并生成展示数据分布的图表。
     """
     base_path = Path(base_dir)
 
@@ -88,44 +82,27 @@ def analyze_and_plot(base_dir='eval_results/patchtst', models_to_plot=None):
                 pred_steps = int(pred_steps_str)
                 df = pd.read_csv(csv_file)
                 
-                # --- 新增代码 ---
-                # 打印当前正在处理的文件信息，以便追踪
-                print(f"\n=======================================================")
-                print(f"读取文件: {csv_file}")
-                print(f"=======================================================")
-                # --- 新增代码结束 ---
-                
                 for metric in metrics_to_plot:
                     if metric in df.columns:
                         
-                        # --- 新增代码 ---
-                        # 打印每个指标的前5个数据
-                        print(f"--- 指标'{metric}'的前5个值 ---")
-                        print(df[metric].head(5))
-                        print("-" * 30)
-                        # --- 新增代码结束 ---
+                        # --- 关键修改开始 ---
+                        # 放弃去极端值逻辑，直接计算所需的分位数
+                        quantiles = df[metric].quantile([0.1, 0.25, 0.5, 0.75, 0.9]).to_dict()
                         
-                        # --- 原有关键修改开始 ---
-                        # 如果指标是 'mse' 或 'mae'，则排除前10%的极端值
-                        if metric in ['mse', 'mae']:
-                            # 计算要保留的行数（底部90%）
-                            n_rows_to_keep = int(len(df) * 1.0)
-                            
-                            # 对值进行排序，并选择最小的90%
-                            sorted_values = df[metric].sort_values()
-                            mean_val = sorted_values.iloc[:n_rows_to_keep].mean()
-                        else:
-                            # 对于其他指标，正常计算均值
-                            mean_val = df[metric].mean()
-                        # --- 原有关键修改结束 ---
-                            
                         all_results.append({
                             'model': model_name, 
                             'pred_steps': pred_steps,
                             'metric': metric,
-                            'mean': mean_val  # 使用新计算的均值
+                            'p10': quantiles[0.1],
+                            'p25': quantiles[0.25],
+                            'p50': quantiles[0.5], # Median
+                            'p75': quantiles[0.75],
+                            'p90': quantiles[0.9],
                         })
+                        # --- 关键修改结束 ---
+                        
                     else:
+                        # 仅在第一次遇到时打印警告，避免刷屏
                         if pred_steps == sorted(model_path.glob('metrics_pred*.csv'))[0] and model_name == models[0]:
                             print(f"警告：指标 '{metric}' 在 {csv_file} 中未找到，将被跳过。")
             except Exception as e:
@@ -137,7 +114,7 @@ def analyze_and_plot(base_dir='eval_results/patchtst', models_to_plot=None):
 
     results_df = pd.DataFrame(all_results)
 
-    # --- 绘图部分 (未修改) ---
+    # --- 绘图部分 (已重写) ---
     try:
         plt.rcParams['font.family'] = 'serif'
         plt.rcParams['font.serif'] = 'Times New Roman'
@@ -147,7 +124,7 @@ def analyze_and_plot(base_dir='eval_results/patchtst', models_to_plot=None):
         print("未找到 Times New Roman 字体，将使用默认 serif 字体。")
 
     fig, axes = plt.subplots(2, 2, figsize=(18, 12), sharex=True)
-    fig.suptitle('Model Performance Comparison (Mean Trend on Linear Scale)', fontsize=22, fontname='Times New Roman')
+    fig.suptitle('Model Performance Comparison (Distribution)', fontsize=22, fontname='Times New Roman')
 
     colormap = plt.get_cmap('tab10') 
     color_map = {model: colormap(i) for i, model in enumerate(models)}
@@ -158,39 +135,86 @@ def analyze_and_plot(base_dir='eval_results/patchtst', models_to_plot=None):
         min_step_diff = np.min(np.diff(unique_pred_steps))
         point_gap = min_step_diff * 0.1
     else:
-        point_gap = 8
+        point_gap = 8 # 如果只有一个预测步长，设置一个默认间距
 
     axes_flat = axes.flatten()
 
     for i, metric in enumerate(metrics_to_plot):
         ax = axes_flat[i]
-        
         n_models = len(models)
+        
+        # 确定Y轴范围，避免极端值导致图像被压缩
+        # 我们基于90%分位数来确定范围，留出一些边距
+        metric_data = results_df[results_df['metric'] == metric]
+        if not metric_data.empty:
+            max_val = metric_data['p90'].max()
+            min_val = metric_data['p10'].min()
+            ax.set_ylim(min_val * 0.9, max_val * 1.1)
+
         for j, model_name in enumerate(models):
             model_data = results_df[(results_df['model'] == model_name) & (results_df['metric'] == metric)]
-            
             if model_data.empty:
                 continue
 
             model_data = model_data.sort_values('pred_steps')
+            offset = (j - (n_models - 1) / 2) * point_gap * 1.5 # 增大数据点之间的水平距离
             
-            offset = (j - (n_models - 1) / 2) * point_gap
-            x_pos = model_data['pred_steps'] + offset
-            
+            # 绘制连接中位数的虚线
             ax.plot(
-                x_pos, model_data['mean'],
-                marker='o',
+                model_data['pred_steps'] + offset, model_data['p50'],
                 linestyle='--',
-                markersize=8,
-                alpha=0.8,
-                color=color_map.get(model_name, 'black'), 
-                label=model_name if i == 0 else ""
+                alpha=0.7,
+                color=color_map.get(model_name, 'black')
             )
+
+            # 绘制每个复合数据点
+            box_width = point_gap * 1.2 # 定义矩形和T型线的宽度
+            for _, row in model_data.iterrows():
+                x_pos = row['pred_steps'] + offset
+                p10, p25, p50, p75, p90 = row['p10'], row['p25'], row['p50'], row['p75'], row['p90']
+
+                # 1. 绘制10%-90%的T型误差线
+                # 垂直线
+                ax.plot([x_pos, x_pos], [p10, p90], color='grey', linewidth=1.0)
+                # 顶部和底部T型头
+                ax.plot([x_pos - box_width/4, x_pos + box_width/4], [p10, p10], color='grey', linewidth=1.0)
+                ax.plot([x_pos - box_width/4, x_pos + box_width/4], [p90, p90], color='grey', linewidth=1.0)
+                
+                # 2. 绘制25%-75%的彩色矩形框
+                rect = Rectangle(
+                    (x_pos - box_width / 2, p25),
+                    box_width,
+                    p75 - p25,
+                    facecolor=color_map.get(model_name, 'grey'),
+                    alpha=0.6,
+                    edgecolor='black',
+                    linewidth=0.5
+                )
+                ax.add_patch(rect)
+
+                # 3. 绘制50%中位数的粗黑线
+                ax.plot(
+                    [x_pos - box_width / 2, x_pos + box_width / 2],
+                    [p50, p50],
+                    color='black',
+                    linewidth=2.0,
+                    solid_capstyle='butt' # 使线条末端平齐
+                )
 
         ax.set_ylabel(metric.upper(), fontsize=14, fontname='Times New Roman')
         ax.set_title(f'Metric: {metric.upper()}', fontsize=16, fontname='Times New Roman')
         ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-        ax.set_yscale('linear')
+        # 对于mse和mae这类可能有极大值的指标，使用对数坐标轴能更好地展示
+        if metric in ['mse', 'mae']:
+             ax.set_yscale('log')
+             # 自动调整Y轴范围，避免因极端值导致低值区域看不清
+             min_val = results_df[results_df['metric'] == metric]['p10'].min()
+             max_val = results_df[results_df['metric'] == metric]['p90'].max()
+             if min_val > 0 and max_val > 0:
+                 ax.set_ylim(min_val * 0.5, max_val * 2)
+        else:
+             ax.set_yscale('linear')
+
 
     for ax in axes[1, :]:
         ax.set_xlabel('Prediction Steps', fontsize=14, fontname='Times New Roman')
@@ -205,8 +229,17 @@ def analyze_and_plot(base_dir='eval_results/patchtst', models_to_plot=None):
     for i in range(len(metrics_to_plot), len(axes_flat)):
         axes_flat[i].set_visible(False)
 
-    handles, labels = axes_flat[0].get_legend_handles_labels()
-    legend = fig.legend(handles, labels, loc='upper right', bbox_to_anchor=(0.98, 0.95), fontsize=10, title='Models')
+    # 创建自定义图例
+    import matplotlib.patches as mpatches
+    handles = [mpatches.Patch(color=color_map[model], label=model, alpha=0.7) for model in models]
+    # 修改后的代码 (推荐)
+    legend = fig.legend(handles=handles, 
+                    labels=[h.get_label() for h in handles], 
+                    loc='upper right', 
+                    bbox_to_anchor=(0.98, 0.95), 
+                    fontsize=10, 
+                    title='Models')
+    
     for text in legend.get_texts():
         text.set_fontname('Times New Roman')
     if legend.get_title():
@@ -215,17 +248,17 @@ def analyze_and_plot(base_dir='eval_results/patchtst', models_to_plot=None):
     
     plt.tight_layout(rect=[0, 0.03, 1, 0.94])
     
-    plt.savefig("model_comparison_plot.png", dpi=300)
+    plt.savefig("model_comparison_distribution_plot.png", dpi=300)
     plt.show()
 
 if __name__ == '__main__':
     # --- 使用方法 ---
-
+ 
     # 示例1: 自动检测 'eval_results/patchtst' 目录下的所有模型
     # analyze_and_plot(base_dir='eval_results/patchtst')
 
-    # 示例2: 只分析和绘制指定的两个模型
-    models_to_run = ['panda256+encoder', 'panda256+encoder+prompt']
+    # 示例2: 只分析和绘制指定的几个模型
+    models_to_run = ['panda256+encoder', 'panda256+UNet']
     analyze_and_plot(base_dir='eval_results/patchtst', models_to_plot=models_to_run)
     
     # 示例3: 如果目录不存在，脚本将自动创建包含三个模型的虚拟数据并绘图

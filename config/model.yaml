@@ -39,6 +39,8 @@ patchtst:
   head_dropout: 0.0
   num_parallel_samples: 100 # NOTE: only used in predict mode if distribution_output is not None
 
+  use_prompt_network: false
+
   # rope positional embeddings
   channel_rope: false  # use rope in channel attention
   max_wavelength: 500

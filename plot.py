@@ -12,16 +12,15 @@ from mpl_toolkits.mplot3d import Axes3D # 3D绘图所需
 # 格式为: {"自定义模型名称": "存放.npy文件的文件夹路径"}
 MODELS_TO_COMPARE = {
     "panda256": "./predictions/test_set/encoder",
-    "prompt1": "./predictions/test_set/prompt_1",
-    "prompt2": "./predictions/test_set/prompt_2",
+    "moirai-large": "./predictions/test_set/moirai_scale",
 }
 
 # 指定要进行可视化对比的系统名称 (与 .npy 文件名中的系统名对应)
 # 例如，如果文件是 '1689573031_Lorenz_preds.npy'，这里就填写 'Lorenz'
-TARGET_SYSTEM_NAME = "ForcedFitzHughNagumo_CaTwoPlus" # !! 请修改为您需要对比的系统名称
+TARGET_SYSTEM_NAME = "Thomas_RayleighBenard" # !! 请修改为您需要对比的系统名称
 
 # 指定要绘制的样本索引 (sample index)。使用固定索引可确保模型间对比的公平性。
-SAMPLE_INDEX_TO_PLOT = 1
+SAMPLE_INDEX_TO_PLOT = 65
 
 # 保存生成图像的文件夹
 PLOT_OUTPUT_DIR = f"./plots/test_set/comparison_{TARGET_SYSTEM_NAME}"
