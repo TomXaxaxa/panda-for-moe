@@ -16,7 +16,7 @@ MODE = 'size'
 GPUS_TO_USE = [2,5,6,7] 
 
 # 当 MODE = 'size' 时生效: 指定要占用的显存大小（单位：GB）
-TARGET_SIZE_GB = 75
+TARGET_SIZE_GB = 35
 
 # 当 MODE = 'ratio' 时生效: 指定要占用的显存比例（0.0 到 1.0 之间）
 TARGET_RATIO = 0.9
