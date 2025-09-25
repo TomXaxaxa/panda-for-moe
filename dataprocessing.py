@@ -13,10 +13,10 @@ MODE = 'size'
 
 # 要使用的GPU设备索引。如果为空列表 `[]`，则表示使用所有可用的GPU。
 # 示例: [0, 1, 3] 表示使用 GPU 0, 1, 3
-GPUS_TO_USE = [2,5,6,7] 
+GPUS_TO_USE = [3] 
 
 # 当 MODE = 'size' 时生效: 指定要占用的显存大小（单位：GB）
-TARGET_SIZE_GB = 35
+TARGET_SIZE_GB = 45
 
 # 当 MODE = 'ratio' 时生效: 指定要占用的显存比例（0.0 到 1.0 之间）
 TARGET_RATIO = 0.9
